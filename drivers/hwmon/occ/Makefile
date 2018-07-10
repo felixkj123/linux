@@ -1,4 +1,4 @@
-occ-hwmon-objs := common.o
+occ-hwmon-objs := common.o sysfs.o
 
 ifeq ($(CONFIG_SENSORS_OCC_P9_SBE), y)
 occ-hwmon-objs += p9_sbe.o
