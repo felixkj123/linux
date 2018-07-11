@@ -1,5 +1,8 @@
+// SPDX-License-Identifier: GPL-2.0
 /*
- * Copyright 2017 IBM Corp.
+ * OCC hwmon P9 driver
+ *
+ * Copyright (C) IBM Corporation 2018
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -64,11 +67,10 @@ static int p9_sbe_occ_send_cmd(struct occ *occ, u8 *cmd)
 
 static int p9_sbe_occ_probe(struct platform_device *pdev)
 {
-	struct occ *occ;
 	int rc;
-	struct p9_sbe_occ *ctx = devm_kzalloc(&pdev->dev,
-						     sizeof(*ctx),
-						     GFP_KERNEL);
+	struct occ *occ;
+	struct p9_sbe_occ *ctx = devm_kzalloc(&pdev->dev, sizeof(*ctx),
+					      GFP_KERNEL);
 	if (!ctx)
 		return -ENOMEM;
 
@@ -81,10 +83,9 @@ static int p9_sbe_occ_probe(struct platform_device *pdev)
 	occ->send_cmd = p9_sbe_occ_send_cmd;
 
 	rc = occ_setup(occ, "p9_occ");
-
-	/* Host is shutdown, don't spew errors */
 	if (rc == -ESHUTDOWN)
-		rc = -ENODEV;
+		rc = -ENODEV;	/* Host is shutdown, don't spew errors */
+
 	return rc;
 }
 
@@ -94,7 +95,6 @@ static int p9_sbe_occ_remove(struct platform_device *pdev)
 	struct p9_sbe_occ *ctx = to_p9_sbe_occ(occ);
 
 	ctx->sbe = NULL;
-
 	occ_shutdown(occ);
 
 	return 0;
@@ -110,6 +110,6 @@ static struct platform_driver p9_sbe_occ_driver = {
 
 module_platform_driver(p9_sbe_occ_driver);
 
-MODULE_AUTHOR("Eddie James <eajames@us.ibm.com>");
+MODULE_AUTHOR("Eddie James <eajames@linux.vnet.ibm.com>");
 MODULE_DESCRIPTION("BMC P9 OCC hwmon driver");
 MODULE_LICENSE("GPL");

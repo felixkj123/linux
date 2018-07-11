@@ -1,5 +1,7 @@
 /*
- * Copyright 2017 IBM Corp.
+ * OCC hwmon driver common definitions, structures, and prototypes
+ *
+ * Copyright (C) IBM Corporation 2018
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -108,17 +110,24 @@ struct occ {
 	struct attribute_group group;
 	const struct attribute_group *groups[2];
 
-	int error;
-	unsigned int error_count;	/* number of errors observed */
-	unsigned long last_safe;	/* time OCC entered safe state */
+	int error;                      /* latest transfer error */
+	unsigned int error_count;       /* number of transfer errors observed */
+	unsigned long last_safe;        /* time OCC entered "safe" state */
 
-	/* store previous poll state to compare; notify sysfs on change */
-	int previous_error;
-	u8 previous_ext_status;
-	u8 previous_occs_present;
+	/*
+	 * Store the previous state data for comparison in order to notify
+	 * sysfs readers of state changes.
+	 */
+	int prev_error;
+	u8 prev_stat;
+	u8 prev_ext_stat;
+	u8 prev_occs_present;
 };
 
 int occ_setup(struct occ *occ, const char *name);
+int occ_setup_sysfs(struct occ *occ);
 void occ_shutdown(struct occ *occ);
+void occ_sysfs_poll_done(struct occ *occ);
+int occ_update_response(struct occ *occ);
 
 #endif /* OCC_COMMON_H */

@@ -1,5 +1,8 @@
+// SPDX-License-Identifier: GPL-2.0
 /*
- * Copyright 2017 IBM Corp.
+ * On-Chip Controller Driver
+ *
+ * Copyright (C) IBM Corporation 2018
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -13,6 +16,7 @@
 #include <linux/errno.h>
 #include <linux/fs.h>
 #include <linux/fsi-sbefifo.h>
+#include <linux/gfp.h>
 #include <linux/idr.h>
 #include <linux/kernel.h>
 #include <linux/list.h>
@@ -24,10 +28,7 @@
 #include <linux/platform_device.h>
 #include <linux/sched.h>
 #include <linux/slab.h>
-#include <linux/spinlock.h>
 #include <linux/uaccess.h>
-#include <linux/wait.h>
-#include <linux/workqueue.h>
 
 #define OCC_SRAM_BYTES		4096
 #define OCC_CMD_DATA_BYTES	4090
@@ -85,11 +86,13 @@ static int occ_open(struct inode *inode, struct file *file)
 
 	if (!client)
 		return -ENOMEM;
+
 	client->buffer = (u8 *)__get_free_page(GFP_KERNEL);
 	if (!client->buffer) {
 		kfree(client);
 		return -ENOMEM;
 	}
+
 	client->occ = occ;
 	mutex_init(&client->lock);
 	file->private_data = client;
@@ -109,6 +112,7 @@ static ssize_t occ_read(struct file *file, char __user *buf, size_t len,
 
 	if (!client)
 		return -ENODEV;
+
 	if (len > OCC_SRAM_BYTES)
 		return -EINVAL;
 
@@ -122,11 +126,11 @@ static ssize_t occ_read(struct file *file, char __user *buf, size_t len,
 
 	/* Grab how much data we have to read */
 	rc = min(len, client->data_size - client->read_offset);
-
 	if (copy_to_user(buf, client->buffer + client->read_offset, rc))
 		rc = -EFAULT;
 	else
 		client->read_offset += rc;
+
  done:
 	mutex_unlock(&client->lock);
 
@@ -153,12 +157,13 @@ static ssize_t occ_write(struct file *file, const char __user *buf,
 	/* Construct the command */
 	cmd = client->buffer;
 
-	/* Sequence number (we could increment it and compare with the response) */
+	/* Sequence number (we could increment and compare with response) */
 	cmd[0] = 1;
 
 	/*
-	 * Copy the user command (assume user data follows the occ command format)
-	 *  byte 0  : command type
+	 * Copy the user command (assume user data follows the occ command
+	 * format)
+	 * byte 0: command type
 	 * bytes 1-2: data length (msb first)
 	 * bytes 3-n: data
 	 */
@@ -177,12 +182,14 @@ static ssize_t occ_write(struct file *file, const char __user *buf,
 	/* Calculate checksum */
 	for (i = 0; i < data_length + 4; ++i)
 		checksum += cmd[i];
+
 	cmd[data_length + 4] = checksum >> 8;
 	cmd[data_length + 5] = checksum & 0xFF;
 
 	/* Submit command */
 	rlen = PAGE_SIZE;
-	rc = fsi_occ_submit(client->occ->dev, cmd, data_length + 6, cmd, &rlen);
+	rc = fsi_occ_submit(client->occ->dev, cmd, data_length + 6, cmd,
+			    &rlen);
 	if (rc)
 		goto done;
 
@@ -192,6 +199,7 @@ static ssize_t occ_write(struct file *file, const char __user *buf,
 
 	/* Done */
 	rc = len;
+
  done:
 	mutex_unlock(&client->lock);
 
@@ -218,9 +226,9 @@ static const struct file_operations occ_fops = {
 
 static int occ_verify_checksum(struct occ_response *resp, u16 data_length)
 {
-	u16 checksum;
 	/* Fetch the two bytes after the data for the checksum. */
 	u16 checksum_resp = get_unaligned_be16(&resp->data[data_length]);
+	u16 checksum;
 	u16 i;
 
 	checksum = resp->seq_no;
@@ -237,8 +245,7 @@ static int occ_verify_checksum(struct occ_response *resp, u16 data_length)
 	return 0;
 }
 
-static int occ_getsram(struct device *sbefifo, u32 address, void *data,
-		       ssize_t len)
+static int occ_getsram(struct occ *occ, u32 address, void *data, ssize_t len)
 {
 	u32 data_len = ((len + 7) / 8) * 8;	/* must be multiples of 8 B */
 	size_t resp_len, resp_data_len;
@@ -256,22 +263,23 @@ static int occ_getsram(struct device *sbefifo, u32 address, void *data,
 	cmd[4] = cpu_to_be32(data_len);
 
 	resp_len = (data_len >> 2) + OCC_SBE_STATUS_WORDS;
-	resp = kzalloc(resp_len << 2 , GFP_KERNEL);
+	resp = kzalloc(resp_len << 2, GFP_KERNEL);
 	if (!resp)
 		return -ENOMEM;
 
-	rc = sbefifo_submit(sbefifo, cmd, 5, resp, &resp_len);
+	rc = sbefifo_submit(occ->sbefifo, cmd, 5, resp, &resp_len);
 	if (rc)
 		goto free;
-	rc = sbefifo_parse_status(sbefifo, SBEFIFO_CMD_GET_OCC_SRAM,
+
+	rc = sbefifo_parse_status(occ->sbefifo, SBEFIFO_CMD_GET_OCC_SRAM,
 				  resp, resp_len, &resp_len);
 	if (rc)
 		goto free;
 
 	resp_data_len = be32_to_cpu(resp[resp_len - 1]);
 	if (resp_data_len != data_len) {
-		pr_err("occ: SRAM read expected %d bytes got %zd\n",
-		       data_len, resp_data_len);
+		dev_err(occ->dev, "SRAM read expected %d bytes got %zd\n",
+			data_len, resp_data_len);
 		rc = -EBADMSG;
 	} else {
 		memcpy(data, resp, len);
@@ -280,14 +288,16 @@ static int occ_getsram(struct device *sbefifo, u32 address, void *data,
 free:
 	/* Convert positive SBEI status */
 	if (rc > 0) {
-		pr_err("occ: SRAM read returned failure status: %08x\n", rc);
+		dev_err(occ->dev, "SRAM read returned failure status: %08x\n",
+			rc);
 		rc = -EBADMSG;
 	}
+
 	kfree(resp);
 	return rc;
 }
 
-static int occ_putsram(struct device *sbefifo, u32 address, const void *data,
+static int occ_putsram(struct occ *occ, u32 address, const void *data,
 		       ssize_t len)
 {
 	size_t cmd_len, buf_len, resp_len, resp_data_len;
@@ -318,37 +328,42 @@ static int occ_putsram(struct device *sbefifo, u32 address, const void *data,
 
 	memcpy(&buf[5], data, len);
 
-	rc = sbefifo_submit(sbefifo, buf, cmd_len, buf, &resp_len);
+	rc = sbefifo_submit(occ->sbefifo, buf, cmd_len, buf, &resp_len);
 	if (rc)
 		goto free;
-	rc = sbefifo_parse_status(sbefifo, SBEFIFO_CMD_PUT_OCC_SRAM,
+
+	rc = sbefifo_parse_status(occ->sbefifo, SBEFIFO_CMD_PUT_OCC_SRAM,
 				  buf, resp_len, &resp_len);
 	if (rc)
 		goto free;
 
 	if (resp_len != 1) {
-		pr_err("occ: SRAM write response lenght invalid: %zd\n",
-		       resp_len);
+		dev_err(occ->dev, "SRAM write response length invalid: %zd\n",
+			resp_len);
 		rc = -EBADMSG;
 	} else {
 		resp_data_len = be32_to_cpu(buf[0]);
 		if (resp_data_len != data_len) {
-			pr_err("occ: SRAM write expected %d bytes got %zd\n",
-			       data_len, resp_data_len);
+			dev_err(occ->dev,
+				"SRAM write expected %d bytes got %zd\n",
+				data_len, resp_data_len);
 			rc = -EBADMSG;
 		}
 	}
+
 free:
 	/* Convert positive SBEI status */
 	if (rc > 0) {
-		pr_err("occ: SRAM write returned failure status: %08x\n", rc);
+		dev_err(occ->dev, "SRAM write returned failure status: %08x\n",
+			rc);
 		rc = -EBADMSG;
 	}
+
 	kfree(buf);
 	return rc;
 }
 
-static int occ_trigger_attn(struct device *sbefifo)
+static int occ_trigger_attn(struct occ *occ)
 {
 	__be32 buf[OCC_SBE_STATUS_WORDS];
 	size_t resp_len, resp_data_len;
@@ -360,38 +375,41 @@ static int occ_trigger_attn(struct device *sbefifo)
 	buf[0] = cpu_to_be32(0x5 + 0x2);        /* Chip-op length in words */
 	buf[1] = cpu_to_be32(SBEFIFO_CMD_PUT_OCC_SRAM);
 	buf[2] = cpu_to_be32(0x3);              /* Mode: Circular */
-	buf[3] = cpu_to_be32(0x0);              /* Address: ignored in mode 3 */
+	buf[3] = cpu_to_be32(0x0);              /* Address: ignore in mode 3 */
 	buf[4] = cpu_to_be32(0x8);              /* Data length in bytes */
 	buf[5] = cpu_to_be32(0x20010000);       /* Trigger OCC attention */
 	buf[6] = 0;
 
-	rc = sbefifo_submit(sbefifo, buf, 7, buf, &resp_len);
+	rc = sbefifo_submit(occ->sbefifo, buf, 7, buf, &resp_len);
 	if (rc)
 		goto error;
-	rc = sbefifo_parse_status(sbefifo, SBEFIFO_CMD_PUT_OCC_SRAM,
+
+	rc = sbefifo_parse_status(occ->sbefifo, SBEFIFO_CMD_PUT_OCC_SRAM,
 				  buf, resp_len, &resp_len);
 	if (rc)
 		goto error;
 
 	if (resp_len != 1) {
-		pr_err("occ: SRAM attn response lenght invalid: %zd\n",
-		       resp_len);
+		dev_err(occ->dev, "SRAM attn response length invalid: %zd\n",
+			resp_len);
 		rc = -EBADMSG;
 	} else {
 		resp_data_len = be32_to_cpu(buf[0]);
 		if (resp_data_len != 8) {
-			pr_err("occ: SRAM attn expected 8 bytes got %zd\n",
-			       resp_data_len);
+			dev_err(occ->dev,
+				"SRAM attn expected 8 bytes got %zd\n",
+				resp_data_len);
 			rc = -EBADMSG;
 		}
 	}
+
  error:
 	/* Convert positive SBEI status */
 	if (rc > 0) {
-		pr_err("occ: SRAM attn returned failure status: %08x\n", rc);
+		dev_err(occ->dev, "SRAM attn returned failure status: %08x\n",
+			rc);
 		rc = -EBADMSG;
 	}
-
 
 	return rc;
 }
@@ -400,16 +418,17 @@ int fsi_occ_submit(struct device *dev, const void *request, size_t req_len,
 		   void *response, size_t *resp_len)
 {
 	const unsigned long timeout = msecs_to_jiffies(OCC_TIMEOUT_MS);
-	const unsigned long wait_time = msecs_to_jiffies(OCC_CMD_IN_PRG_WAIT_MS);
+	const unsigned long wait_time =
+		msecs_to_jiffies(OCC_CMD_IN_PRG_WAIT_MS);
 	struct occ *occ = dev_get_drvdata(dev);
 	struct occ_response *resp = response;
-	struct device *sbefifo = occ->sbefifo;
 	u16 resp_data_length;
 	unsigned long start;
 	int rc;
 
 	if (!occ)
 		return -ENODEV;
+
 	if (*resp_len < 7) {
 		dev_dbg(dev, "Bad resplen %zd\n", *resp_len);
 		return -EINVAL;
@@ -417,18 +436,18 @@ int fsi_occ_submit(struct device *dev, const void *request, size_t req_len,
 
 	mutex_lock(&occ->occ_lock);
 
-	rc = occ_putsram(sbefifo, OCC_SRAM_CMD_ADDR, request, req_len);
+	rc = occ_putsram(occ, OCC_SRAM_CMD_ADDR, request, req_len);
 	if (rc)
 		goto done;
 
-	rc = occ_trigger_attn(sbefifo);
+	rc = occ_trigger_attn(occ);
 	if (rc)
 		goto done;
 
 	/* Read occ response header */
 	start = jiffies;
 	do {
-		rc = occ_getsram(sbefifo, OCC_SRAM_RSP_ADDR, resp, 8);
+		rc = occ_getsram(occ, OCC_SRAM_RSP_ADDR, resp, 8);
 		if (rc)
 			goto done;
 
@@ -458,15 +477,15 @@ int fsi_occ_submit(struct device *dev, const void *request, size_t req_len,
 	/* Grab the rest */
 	if (resp_data_length > 1) {
 		/* already got 3 bytes resp, also need 2 bytes checksum */
-		rc = occ_getsram(sbefifo, OCC_SRAM_RSP_ADDR + 8,
+		rc = occ_getsram(occ, OCC_SRAM_RSP_ADDR + 8,
 				 &resp->data[3], resp_data_length - 1);
 		if (rc)
 			goto done;
 	}
 
 	*resp_len = resp_data_length + 7;
-
 	rc = occ_verify_checksum(resp, resp_data_length);
+
  done:
 	mutex_unlock(&occ->occ_lock);
 
@@ -585,6 +604,6 @@ static void occ_exit(void)
 module_init(occ_init);
 module_exit(occ_exit);
 
-MODULE_AUTHOR("Eddie James <eajames@us.ibm.com>");
+MODULE_AUTHOR("Eddie James <eajames@linux.vnet.ibm.com>");
 MODULE_DESCRIPTION("BMC P9 OCC driver");
 MODULE_LICENSE("GPL");
