@@ -20,6 +20,7 @@
 
 #define ASPEED_RESET_CTRL	0x04
 #define ASPEED_CLK_SELECTION	0x08
+#define  ASPEED_CLK_SEL_VE	GENMASK(3, 2)
 #define ASPEED_CLK_STOP_CTRL	0x0c
 #define ASPEED_MPLL_PARAM	0x20
 #define ASPEED_HPLL_PARAM	0x24
@@ -87,7 +88,7 @@ struct aspeed_clk_gate {
 /* TODO: ask Aspeed about the actual parent data */
 static const struct aspeed_gate_data aspeed_gates[] = {
 	/*				 clk rst   name			parent	flags */
-	[ASPEED_CLK_GATE_ECLK] =	{  0, -1, "eclk-gate",		"eclk",	0 }, /* Video Engine */
+	[ASPEED_CLK_GATE_ECLK] =	{  0,  6, "eclk-gate",		"eclk",	0 }, /* Video Engine */
 	[ASPEED_CLK_GATE_GCLK] =	{  1,  7, "gclk-gate",		NULL,	0 }, /* 2D engine */
 	[ASPEED_CLK_GATE_MCLK] =	{  2, -1, "mclk-gate",		"mpll",	CLK_IS_CRITICAL }, /* SDRAM */
 	[ASPEED_CLK_GATE_VCLK] =	{  3,  6, "vclk-gate",		NULL,	0 }, /* Video Capture */
@@ -111,6 +112,18 @@ static const struct aspeed_gate_data aspeed_gates[] = {
 	[ASPEED_CLK_GATE_UART4CLK] =	{ 26, -1, "uart4clk-gate",	"uart",	0 }, /* UART4 */
 	[ASPEED_CLK_GATE_SDCLKCLK] =	{ 27, 16, "sdclk-gate",		NULL,	0 }, /* SDIO/SD */
 	[ASPEED_CLK_GATE_LHCCLK] =	{ 28, -1, "lhclk-gate",		"lhclk", 0 }, /* LPC master/LPC+ */
+};
+
+static const struct clk_div_table ast2500_eclk_div_table[] = {
+	{ 0x0, 2 },
+	{ 0x1, 2 },
+	{ 0x2, 3 },
+	{ 0x3, 4 },
+	{ 0x4, 5 },
+	{ 0x5, 6 },
+	{ 0x6, 7 },
+	{ 0x7, 8 },
+	{ 0 }
 };
 
 static const struct clk_div_table ast2500_mac_div_table[] = {
@@ -192,18 +205,21 @@ static struct clk_hw *aspeed_ast2500_calc_pll(const char *name, u32 val)
 
 struct aspeed_clk_soc_data {
 	const struct clk_div_table *div_table;
+	const struct clk_div_table *eclk_div_table;
 	const struct clk_div_table *mac_div_table;
 	struct clk_hw *(*calc_pll)(const char *name, u32 val);
 };
 
 static const struct aspeed_clk_soc_data ast2500_data = {
 	.div_table = ast2500_div_table,
+	.eclk_div_table = ast2500_eclk_div_table,
 	.mac_div_table = ast2500_mac_div_table,
 	.calc_pll = aspeed_ast2500_calc_pll,
 };
 
 static const struct aspeed_clk_soc_data ast2400_data = {
 	.div_table = ast2400_div_table,
+	.eclk_div_table = ast2400_div_table,
 	.mac_div_table = ast2400_div_table,
 	.calc_pll = aspeed_ast2400_calc_pll,
 };
@@ -317,6 +333,7 @@ static const u8 aspeed_resets[] = {
 	[ASPEED_RESET_PECI]	= 10,
 	[ASPEED_RESET_I2C]	=  2,
 	[ASPEED_RESET_AHB]	=  1,
+	[ASPEED_RESET_VIDEO]	=  6,
 
 	/*
 	 * SCUD4 resets start at an offset to separate them from
@@ -521,6 +538,48 @@ static int aspeed_clk_probe(struct platform_device *pdev)
 	if (IS_ERR(hw))
 		return PTR_ERR(hw);
 	aspeed_clk_data->hws[ASPEED_CLK_24M] = hw;
+
+	/* Video Engine (ECLK) clock divider (ignore mux; set parent MPLL) */
+	regmap_read(map, ASPEED_CLK_SELECTION, &val);
+	if (val & ASPEED_CLK_SEL_VE) {
+		/* ECLK clock select isn't MPLL; reset to MPLL */
+		u32 clk = BIT(aspeed_gates[ASPEED_CLK_GATE_ECLK].clock_idx);
+		u32 rst = BIT(aspeed_gates[ASPEED_CLK_GATE_ECLK].reset_idx);
+		u32 stop;
+
+		dev_info(dev, "setting eclk mux to mpll\n");
+
+		/* Put Video Engine in reset */
+		regmap_update_bits(map, ASPEED_RESET_CTRL, rst, rst);
+		udelay(100);
+
+		/* Stop the clock if it's running */
+		regmap_read(map, ASPEED_CLK_STOP_CTRL, &stop);
+		if (!(stop & clk))
+			regmap_update_bits(map, ASPEED_CLK_STOP_CTRL, clk,
+					   clk);
+
+		/* Set clock select to MPLL */
+		regmap_update_bits(map, ASPEED_CLK_SELECTION,
+				   ASPEED_CLK_SEL_VE, 0);
+
+		/* Start the clock if it was originally running */
+		if (!(stop & clk)) {
+			regmap_update_bits(map, ASPEED_CLK_STOP_CTRL, clk, 0);
+			mdelay(10);
+		}
+
+		/* Take Video Engine out of reset */
+		regmap_update_bits(map, ASPEED_RESET_CTRL, rst, 0);
+	}
+
+	hw = clk_hw_register_divider_table(dev, "eclk", "mpll", 0,
+			scu_base + ASPEED_CLK_SELECTION, 28, 3, 0,
+			soc_data->eclk_div_table,
+			&aspeed_clk_lock);
+	if (IS_ERR(hw))
+		return PTR_ERR(hw);
+	aspeed_clk_data->hws[ASPEED_CLK_ECLK] = hw;
 
 	/*
 	 * TODO: There are a number of clocks that not included in this driver
