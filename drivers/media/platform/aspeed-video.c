@@ -52,7 +52,7 @@
 #define PACKET_SIZE			0x20000
 
 #define VE_SRC_BUFFER_SIZE		0x900000 /* 1920 * 1200, 32bpp */
-#define VE_COMP_BUFFER_SIZE		0x100000 /* 128K packet * 8 packets */
+#define VE_COMP_BUFFER_SIZE		0x80000 /* 128K packet * 4 packets */
 #define VE_JPEG_BUFFER_SIZE		0x006000 /* 512 * 12 * 4 */
 
 #define VE_PROTECTION_KEY		0x000
@@ -196,20 +196,11 @@
 #define VE_MEM_RESTRICT_START		0x310
 #define VE_MEM_RESTRICT_END		0x314
 
-#define SCU_VGA1			0x40
-#define  SCU_VGA1_FW_INIT_DRAM		BIT(6)
-#define  SCU_VGA1_INIT_DRAM		BIT(7)
-
-struct aspeed_video_frame {
-	u32 offset;
-	u32 size;
-	struct timeval timestamp;
-};
-
 enum {
 	VIDEO_MODE_DETECT_DONE,
-	VIDEO_STREAMING,
 	VIDEO_RES_CHANGE,
+	VIDEO_FRAME_AVAILABLE,
+	VIDEO_FRAME_TRIGGERED,
 };
 
 struct aspeed_video_addr {
@@ -222,7 +213,6 @@ struct aspeed_video {
 	struct clk *eclk;
 	struct clk *vclk;
 	struct reset_control *rst;
-	struct regmap *scu;
 
 	struct device *dev;
 	struct v4l2_device v4l2_dev;
@@ -234,21 +224,13 @@ struct aspeed_video {
 	struct delayed_work res_work;
 	unsigned long flags;
 
-	u32 previous_comp_offset;
-	u32 previous_comp_proc_offset;
-	unsigned int frame_counter;
-	unsigned int frame_done_idx;
-	unsigned int frame_idx;
-	unsigned int frame_read_count;
-	struct aspeed_video_frame frames[MAX_NUM_FRAMES];
-	spinlock_t frame_lock;
-
-	unsigned int comp_ready_count;
+	int frame_idx;
+	u32 frame_size;
 
 	dma_addr_t max;
 	dma_addr_t min;
 	struct aspeed_video_addr srcs[2];
-	struct aspeed_video_addr comp;
+	struct aspeed_video_addr comp[2];
 	struct aspeed_video_addr jpeg;
 
 	int frame_rate;
@@ -332,15 +314,20 @@ static int aspeed_video_start_frame(struct aspeed_video *video)
 	if (aspeed_video_engine_busy(video))
 		return -EBUSY;
 
-	aspeed_video_write(video, VE_COMP_OFFSET, 0);
+	video->frame_idx = (video->frame_idx + 1) % 2;
+
 	aspeed_video_write(video, VE_COMP_PROC_OFFSET, 0);
+	aspeed_video_write(video, VE_COMP_OFFSET, 0);
+	aspeed_video_write(video, VE_COMP_ADDR,
+			   video->comp[video->frame_idx].dma);
+
+	set_bit(VIDEO_FRAME_TRIGGERED, &video->flags);
 
 	aspeed_video_update(video, VE_INTERRUPT_CTRL, 0xFFFFFFFF,
-			    VE_INTERRUPT_COMP_READY |
-			    VE_INTERRUPT_FRAME_COMPLETE |
-			    VE_INTERRUPT_HANG_WD);
+			    VE_INTERRUPT_COMP_COMPLETE |
+			    VE_INTERRUPT_CAPTURE_COMPLETE);
 
-	aspeed_video_update(video, VE_SEQ_CTRL, ~VE_SEQ_CTRL_FORCE_IDLE,
+	aspeed_video_update(video, VE_SEQ_CTRL, 0xFFFFFFFF,
 			    VE_SEQ_CTRL_TRIG_CAPTURE | VE_SEQ_CTRL_TRIG_COMP);
 
 	return 0;
@@ -398,6 +385,7 @@ static irqreturn_t aspeed_video_irq(int irq, void *arg)
 
 	if (atomic_read(&video->clients) == 0) {
 		dev_info(video->dev, "irq with no client; disabling irqs\n");
+
 		aspeed_video_write(video, VE_INTERRUPT_CTRL, 0);
 		aspeed_video_write(video, VE_INTERRUPT_STATUS, 0xFFFFFFFF);
 		return IRQ_HANDLED;
@@ -407,7 +395,6 @@ static irqreturn_t aspeed_video_irq(int irq, void *arg)
 	if (sts & VE_INTERRUPT_MODE_DETECT_WD) {
 		dev_info(video->dev, "resolution changed; resetting\n");
 		set_bit(VIDEO_RES_CHANGE, &video->flags);
-		video->frame_counter = 0;	/* prevent further reads */
 
 		aspeed_video_off(video);
 
@@ -417,92 +404,35 @@ static irqreturn_t aspeed_video_irq(int irq, void *arg)
 	}
 
 	if (sts & VE_INTERRUPT_MODE_DETECT) {
-		set_bit(VIDEO_MODE_DETECT_DONE, &video->flags);
 		aspeed_video_update(video, VE_INTERRUPT_CTRL,
 				    ~VE_INTERRUPT_MODE_DETECT, 0);
+		aspeed_video_write(video, VE_INTERRUPT_STATUS,
+				   VE_INTERRUPT_MODE_DETECT);
+
+		set_bit(VIDEO_MODE_DETECT_DONE, &video->flags);
 		wake_up_interruptible_all(&video->wait);
 	}
 
-	if (sts & VE_INTERRUPT_FRAME_COMPLETE) {
-		unsigned long flags;
-		unsigned int pidx = (video->frame_idx ?: MAX_NUM_FRAMES) - 1;
-		u32 offs = aspeed_video_read(video, VE_OFFSET_COMP_STREAM);
+	if ((sts & VE_INTERRUPT_COMP_COMPLETE) &&
+	    (sts & VE_INTERRUPT_CAPTURE_COMPLETE)) {
+		video->frame_size = aspeed_video_read(video,
+						      VE_OFFSET_COMP_STREAM);
 
-		video->comp_ready_count = 0;
+		aspeed_video_update(video, VE_INTERRUPT_CTRL,
+				    ~(VE_INTERRUPT_COMP_COMPLETE |
+				      VE_INTERRUPT_CAPTURE_COMPLETE), 0);
+		aspeed_video_write(video, VE_INTERRUPT_STATUS,
+				   VE_INTERRUPT_COMP_COMPLETE |
+				   VE_INTERRUPT_CAPTURE_COMPLETE);
+		aspeed_video_update(video, VE_SEQ_CTRL,
+				    ~(VE_SEQ_CTRL_TRIG_CAPTURE |
+				      VE_SEQ_CTRL_FORCE_IDLE |
+				      VE_SEQ_CTRL_TRIG_COMP), 0);
 
-		spin_lock_irqsave(&video->frame_lock, flags);
-		if (offs < video->frames[pidx].offset)
-			video->frames[pidx].size = (VE_COMP_BUFFER_SIZE -
-				video->frames[pidx].offset) + offs;
-		else
-			video->frames[pidx].size = offs -
-				video->frames[pidx].offset;
-		v4l2_get_timestamp(&video->frames[pidx].timestamp);
-		video->frames[video->frame_idx].offset = offs;
-
-		video->frame_idx = (video->frame_idx + 1) % MAX_NUM_FRAMES;
-		video->frame_done_idx = pidx;
-		video->frame_counter++;
-		spin_unlock_irqrestore(&video->frame_lock, flags);
-
-		dev_dbg(video->dev, "frame[%d] offs[%08x] size[%08x]\n", pidx,
-			video->frames[pidx].offset, video->frames[pidx].size);
-
+		set_bit(VIDEO_FRAME_AVAILABLE, &video->flags);
+		clear_bit(VIDEO_FRAME_TRIGGERED, &video->flags);
 		wake_up_interruptible_all(&video->wait);
 	}
-
-	if (sts & VE_INTERRUPT_COMP_READY) {
-		unsigned int pidx = (video->frame_idx ?: MAX_NUM_FRAMES) - 1;
-		u32 comp_offset = video->frames[video->frame_done_idx].offset;
-		u32 comp_proc_offset = video->frames[pidx].offset;
-
-		if (comp_proc_offset != video->previous_comp_proc_offset) {
-			aspeed_video_write(video, VE_COMP_PROC_OFFSET,
-					   comp_proc_offset);
-			video->previous_comp_proc_offset = comp_proc_offset;
-		} else if (video->previous_comp_proc_offset + PACKET_SIZE >
-			   VE_COMP_BUFFER_SIZE) {
-			aspeed_video_write(video, VE_COMP_PROC_OFFSET,
-					   VE_COMP_BUFFER_SIZE);
-			video->previous_comp_proc_offset = VE_COMP_BUFFER_SIZE;
-		}
-
-		if (comp_offset != video->previous_comp_offset) {
-			aspeed_video_write(video, VE_COMP_OFFSET,
-					   comp_offset);
-			video->previous_comp_offset = comp_offset;
-		}
-
-		if (video->comp_ready_count++ > NUM_SPURIOUS_COMP_READY) {
-			/*
-			 * Disable and re-enable compression ready irq, which
-			 * can kickstart compression engine again?
-			 */
-			aspeed_video_update(video, VE_INTERRUPT_CTRL,
-					    ~VE_INTERRUPT_COMP_READY, 0);
-			udelay(1);
-			aspeed_video_update(video, VE_INTERRUPT_CTRL,
-					    0xFFFFFFFF,
-					    VE_INTERRUPT_COMP_READY);
-			video->comp_ready_count = 0;
-		}
-	}
-
-	if (sts & VE_INTERRUPT_HANG_WD) {
-		u32 seq_ctrl = aspeed_video_read(video, VE_SEQ_CTRL);
-
-		if ((seq_ctrl & VE_SEQ_CTRL_CAP_BUSY) &&
-		    !(seq_ctrl & VE_SEQ_CTRL_COMP_BUSY)) {
-			aspeed_video_update(video, VE_SEQ_CTRL, 0xFFFFFFFF,
-					    VE_SEQ_CTRL_FORCE_IDLE);
-			aspeed_video_update(video, VE_INTERRUPT_CTRL,
-					    ~VE_INTERRUPT_HANG_WD, 0);
-		} else {
-			dev_info(video->dev, "irq hang wd but cap busy!\n");
-		}
-	}
-
-	aspeed_video_write(video, VE_INTERRUPT_STATUS, sts);
 
 	return IRQ_HANDLED;
 }
@@ -638,8 +568,7 @@ static void aspeed_video_init_regs(struct aspeed_video *video)
 		FIELD_PREP(VE_COMP_CTRL_DCT_LUM, video->jpeg_quality) |
 		FIELD_PREP(VE_COMP_CTRL_DCT_CHR, video->jpeg_quality | 0x10);
 	u32 ctrl = VE_CTRL_DIRECT_FETCH | VE_CTRL_AUTO_OR_CURSOR;
-	u32 seq_ctrl = VE_SEQ_CTRL_AUTO_COMP | VE_SEQ_CTRL_MULT_FRAME |
-		VE_SEQ_CTRL_JPEG_MODE;
+	u32 seq_ctrl = VE_SEQ_CTRL_AUTO_COMP | VE_SEQ_CTRL_JPEG_MODE;
 
 	if (video->frame_rate)
 		ctrl |= FIELD_PREP(VE_CTRL_FRC, video->frame_rate);
@@ -665,7 +594,7 @@ static void aspeed_video_init_regs(struct aspeed_video *video)
 	/* Set buffer addresses */
 	aspeed_video_write(video, VE_SRC0_ADDR, video->srcs[0].dma);
 	aspeed_video_write(video, VE_SRC1_ADDR, video->srcs[1].dma);
-	aspeed_video_write(video, VE_COMP_ADDR, video->comp.dma);
+	aspeed_video_write(video, VE_COMP_ADDR, video->comp[0].dma);
 	aspeed_video_write(video, VE_JPEG_ADDR, video->jpeg.dma);
 
 	/* Set control registers */
@@ -674,7 +603,7 @@ static void aspeed_video_init_regs(struct aspeed_video *video)
 	aspeed_video_write(video, VE_COMP_CTRL, comp_ctrl);
 
 	/* Compression buffer size */
-	aspeed_video_write(video, VE_STREAM_BUF_SIZE, 0xf);
+	aspeed_video_write(video, VE_STREAM_BUF_SIZE, 0x7);
 
 	/* Don't downscale */
 	aspeed_video_write(video, VE_SCALING_FACTOR, 0x10001000);
@@ -711,13 +640,26 @@ static int aspeed_video_allocate_cma(struct aspeed_video *video)
 		goto free_src0;
 	}
 
-	video->comp.virt = dma_alloc_coherent(video->dev, VE_COMP_BUFFER_SIZE,
-					      &video->comp.dma, GFP_KERNEL);
-	if (!video->comp.virt) {
+	video->comp[0].virt = dma_alloc_coherent(video->dev,
+						 VE_COMP_BUFFER_SIZE,
+						 &video->comp[0].dma,
+						 GFP_KERNEL);
+	if (!video->comp[0].virt) {
 		dev_err(video->dev,
-			"Failed to allocate compression buffer, size[%x]\n",
+			"Failed to allocate compression buffer 0, size[%x]\n",
 			VE_COMP_BUFFER_SIZE);
 		goto free_src1;
+	}
+
+	video->comp[1].virt = dma_alloc_coherent(video->dev,
+						 VE_COMP_BUFFER_SIZE,
+						 &video->comp[1].dma,
+						 GFP_KERNEL);
+	if (!video->comp[0].virt) {
+		dev_err(video->dev,
+			"Failed to allocate compression buffer 1, size[%x]\n",
+			VE_COMP_BUFFER_SIZE);
+		goto free_comp0;
 	}
 
 	video->jpeg.virt = dma_alloc_coherent(video->dev, VE_JPEG_BUFFER_SIZE,
@@ -726,7 +668,7 @@ static int aspeed_video_allocate_cma(struct aspeed_video *video)
 		dev_err(video->dev,
 			"Failed to allocate JPEG buffer, size[%x]\n",
 			VE_JPEG_BUFFER_SIZE);
-		goto free_comp;
+		goto free_comp1;
 	}
 
 	if (video->fmt.pixelformat == V4L2_PIX_FMT_YUV420)
@@ -740,16 +682,21 @@ static int aspeed_video_allocate_cma(struct aspeed_video *video)
 	 */
 	video->max = max(video->srcs[0].dma + VE_SRC_BUFFER_SIZE,
 			 video->srcs[1].dma + VE_SRC_BUFFER_SIZE);
-	video->max = max(video->max, video->comp.dma + VE_COMP_BUFFER_SIZE);
+	video->max = max(video->max, video->comp[0].dma + VE_COMP_BUFFER_SIZE);
+	video->max = max(video->max, video->comp[1].dma + VE_COMP_BUFFER_SIZE);
 
 	video->min = min(video->srcs[0].dma, video->srcs[1].dma);
-	video->min = min(video->min, video->comp.dma);
+	video->min = min(video->min, video->comp[0].dma);
+	video->min = min(video->min, video->comp[1].dma);
 
 	return 0;
 
-free_comp:
-	dma_free_coherent(video->dev, VE_COMP_BUFFER_SIZE, video->comp.virt,
-			  video->comp.dma);
+free_comp1:
+	dma_free_coherent(video->dev, VE_COMP_BUFFER_SIZE, video->comp[1].virt,
+			  video->comp[1].dma);
+free_comp0:
+	dma_free_coherent(video->dev, VE_COMP_BUFFER_SIZE, video->comp[0].virt,
+			  video->comp[0].dma);
 free_src1:
 	dma_free_coherent(video->dev, VE_SRC_BUFFER_SIZE, video->srcs[1].virt,
 			  video->srcs[1].dma);
@@ -764,8 +711,10 @@ static void aspeed_video_free_cma(struct aspeed_video *video)
 {
 	dma_free_coherent(video->dev, VE_JPEG_BUFFER_SIZE, video->jpeg.virt,
 			  video->jpeg.dma);
-	dma_free_coherent(video->dev, VE_COMP_BUFFER_SIZE, video->comp.virt,
-			  video->comp.dma);
+	dma_free_coherent(video->dev, VE_COMP_BUFFER_SIZE, video->comp[1].virt,
+			  video->comp[1].dma);
+	dma_free_coherent(video->dev, VE_COMP_BUFFER_SIZE, video->comp[0].virt,
+			  video->comp[0].dma);
 	dma_free_coherent(video->dev, VE_SRC_BUFFER_SIZE, video->srcs[1].virt,
 			  video->srcs[1].dma);
 	dma_free_coherent(video->dev, VE_SRC_BUFFER_SIZE, video->srcs[0].virt,
@@ -775,8 +724,10 @@ static void aspeed_video_free_cma(struct aspeed_video *video)
 	video->srcs[0].virt = NULL;
 	video->srcs[1].dma = 0ULL;
 	video->srcs[1].virt = NULL;
-	video->comp.dma = 0ULL;
-	video->comp.virt = NULL;
+	video->comp[0].dma = 0ULL;
+	video->comp[0].virt = NULL;
+	video->comp[1].dma = 0ULL;
+	video->comp[1].virt = NULL;
 	video->jpeg.dma = 0ULL;
 	video->jpeg.virt = NULL;
 }
@@ -796,6 +747,8 @@ static int aspeed_video_start(struct aspeed_video *video)
 	if (rc)
 		aspeed_video_free_cma(video);
 
+	clear_bit(VIDEO_FRAME_TRIGGERED, &video->flags);
+
 	return rc;
 }
 
@@ -807,7 +760,7 @@ static void aspeed_video_stop(struct aspeed_video *video)
 
 	aspeed_video_free_cma(video);
 
-	clear_bit(VIDEO_STREAMING, &video->flags);
+	clear_bit(VIDEO_FRAME_AVAILABLE, &video->flags);
 }
 
 static int aspeed_video_querycap(struct file *file, void *fh,
@@ -945,24 +898,6 @@ static const struct v4l2_ioctl_ops aspeed_video_ioctls = {
 	.vidioc_s_parm = aspeed_video_set_parm,
 };
 
-static bool aspeed_video_frame_available(struct aspeed_video *video)
-{
-	return video->frame_counter > video->frame_read_count;
-}
-
-static void aspeed_video_reinit_counters(struct aspeed_video *video)
-{
-	video->previous_comp_offset = 0;
-	video->previous_comp_proc_offset = 0;
-	video->frame_counter = 0;
-	video->frame_done_idx = 0;
-	video->frame_idx = 1;
-	video->frame_read_count = 0;
-	memset(video->frames, 0,
-	       sizeof(struct aspeed_video_frame) * MAX_NUM_FRAMES);
-	video->comp_ready_count = 0;
-}
-
 static void aspeed_video_resolution_work(struct work_struct *work)
 {
 	int rc;
@@ -982,9 +917,9 @@ static void aspeed_video_resolution_work(struct work_struct *work)
 	if (rc) {
 		dev_err(video->dev,
 			"resolution changed; couldn't get new resolution\n");
-	} else if (test_bit(VIDEO_STREAMING, &video->flags)) {
-		aspeed_video_reinit_counters(video);
-		aspeed_video_start_frame(video);
+	} else {
+		video->frame_idx = 0;
+		clear_bit(VIDEO_FRAME_TRIGGERED, &video->flags);
 	}
 
 done:
@@ -992,26 +927,28 @@ done:
 	wake_up_interruptible_all(&video->wait);
 }
 
+static bool aspeed_video_frame_available(struct aspeed_video *video)
+{
+	if (!test_and_clear_bit(VIDEO_FRAME_AVAILABLE, &video->flags)) {
+		if (!test_bit(VIDEO_FRAME_TRIGGERED, &video->flags))
+			aspeed_video_start_frame(video);
+
+		return false;
+	}
+
+	return true;
+}
+
 static ssize_t aspeed_video_file_read(struct file *file, char __user *buf,
 				      size_t count, loff_t *ppos)
 {
 	int rc;
-	unsigned long flags;
+	int fidx;
 	size_t size;
 	struct aspeed_video *video = video_drvdata(file);
-	struct aspeed_video_frame *latest;
 
 	if (mutex_lock_interruptible(&video->video_lock))
 		return -EINTR;
-
-	if (!test_bit(VIDEO_STREAMING, &video->flags)) {
-		aspeed_video_reinit_counters(video);
-		rc = aspeed_video_start_frame(video);
-		if (rc)
-			goto unlock;
-
-		set_bit(VIDEO_STREAMING, &video->flags);
-	}
 
 	if (file->f_flags & O_NONBLOCK) {
 		if (!aspeed_video_frame_available(video)) {
@@ -1030,31 +967,13 @@ static ssize_t aspeed_video_file_read(struct file *file, char __user *buf,
 	}
 
 ready:
-	spin_lock_irqsave(&video->frame_lock, flags);
-	latest = &video->frames[video->frame_done_idx];
-	video->frame_read_count = video->frame_counter;
-	spin_unlock_irqrestore(&video->frame_lock, flags);
+	fidx = video->frame_idx;
+	size = min_t(size_t, video->frame_size, count);
+	aspeed_video_start_frame(video);
 
-	size = min_t(size_t, count, latest->size);
-	if (latest->offset + size > VE_COMP_BUFFER_SIZE) {
-		size_t remainder = VE_COMP_BUFFER_SIZE - latest->offset;
-
-		if (copy_to_user(buf, video->comp.virt + latest->offset,
-				 remainder)) {
-			rc = -EFAULT;
-			goto unlock;
-		}
-		if (copy_to_user(&buf[remainder], video->comp.virt,
-				 size - remainder)) {
-			rc = -EFAULT;
-			goto unlock;
-		}
-	} else {
-		if (copy_to_user(buf, video->comp.virt + latest->offset,
-				 size)) {
-			rc = -EFAULT;
-			goto unlock;
-		}
+	if (copy_to_user(buf, video->comp[fidx].virt, size)) {
+		rc = -EFAULT;
+		goto unlock;
 	}
 
 	rc = size;
@@ -1143,19 +1062,6 @@ static int aspeed_video_setup_video(struct aspeed_video *video)
 	return 0;
 }
 
-static void aspeed_video_scu_init(struct aspeed_video *video)
-{
-	unsigned int scu_vga1;
-
-	regmap_read(video->scu, SCU_VGA1, &scu_vga1);
-	dev_info(video->dev, "scu@0x40[%08x]\n", scu_vga1);
-	if (scu_vga1 & SCU_VGA1_INIT_DRAM) {
-		dev_info(video->dev, "set fw init dram\n");
-		regmap_update_bits(video->scu, SCU_VGA1, SCU_VGA1_FW_INIT_DRAM,
-				   SCU_VGA1_FW_INIT_DRAM);
-	}
-}
-
 static int aspeed_video_init(struct aspeed_video *video)
 {
 	int irq;
@@ -1173,12 +1079,6 @@ static int aspeed_video_init(struct aspeed_video *video)
 	if (rc < 0) {
 		dev_err(dev, "Unable to request IRQ %d\n", irq);
 		return rc;
-	}
-
-	video->scu = syscon_regmap_lookup_by_phandle(dev->of_node, "reg-scu");
-	if (IS_ERR(video->scu)) {
-		dev_err(dev, "Unable to get SCU regs\n");
-		return PTR_ERR(video->scu);
 	}
 
 	video->eclk = devm_clk_get(dev, "eclk-gate");
@@ -1212,8 +1112,6 @@ static int aspeed_video_init(struct aspeed_video *video)
 		return rc;
 	}
 
-	aspeed_video_scu_init(video);
-
 	return 0;
 }
 
@@ -1231,7 +1129,6 @@ static int aspeed_video_probe(struct platform_device *pdev)
 	mutex_init(&video->video_lock);
 	init_waitqueue_head(&video->wait);
 	INIT_DELAYED_WORK(&video->res_work, aspeed_video_resolution_work);
-	spin_lock_init(&video->frame_lock);
 
 	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
 
