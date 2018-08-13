@@ -42,17 +42,16 @@
 
 #define DEVICE_NAME			"aspeed-video"
 
-#define MAX_NUM_FRAMES			32
+#define NUM_BUFFERS			2
 #define NUM_RES_DETECT_ATTEMPTS		5
 #define NUM_POLARITY_CHECKS		10
 #define NUM_SPURIOUS_COMP_READY		64
 #define RESOLUTION_CHANGE_DELAY		msecs_to_jiffies(500)
 #define MODE_DETECT_TIMEOUT		msecs_to_jiffies(500)
-#define DIRECT_FETCH_THRESHOLD		0xc0000
-#define PACKET_SIZE			0x20000
+#define DIRECT_FETCH_THRESHOLD		0xc0000  /* 1024 * 768, 32bpp */
 
 #define VE_SRC_BUFFER_SIZE		0x900000 /* 1920 * 1200, 32bpp */
-#define VE_COMP_BUFFER_SIZE		0x80000 /* 128K packet * 4 packets */
+#define VE_COMP_BUFFER_SIZE		0x080000 /* 128K packet * 4 packets */
 #define VE_JPEG_BUFFER_SIZE		0x006000 /* 512 * 12 * 4 */
 
 #define VE_PROTECTION_KEY		0x000
@@ -197,15 +196,24 @@
 #define VE_MEM_RESTRICT_END		0x314
 
 enum {
+	BUF_DONE,
+};
+
+enum {
 	VIDEO_MODE_DETECT_DONE,
 	VIDEO_RES_CHANGE,
 	VIDEO_FRAME_AVAILABLE,
 	VIDEO_FRAME_TRIGGERED,
+	VIDEO_STREAMING,
 };
 
 struct aspeed_video_addr {
 	dma_addr_t dma;
 	void *virt;
+};
+
+struct aspeed_video_buf {
+	unsigned long flags;
 };
 
 struct aspeed_video {
@@ -224,6 +232,7 @@ struct aspeed_video {
 	struct delayed_work res_work;
 	unsigned long flags;
 
+	int bufs_queued;
 	int frame_idx;
 	u32 frame_size;
 
@@ -232,6 +241,8 @@ struct aspeed_video {
 	struct aspeed_video_addr srcs[2];
 	struct aspeed_video_addr comp[2];
 	struct aspeed_video_addr jpeg;
+
+	struct aspeed_video_buf bufs[NUM_BUFFERS];
 
 	int frame_rate;
 	int jpeg_quality;
@@ -429,6 +440,7 @@ static irqreturn_t aspeed_video_irq(int irq, void *arg)
 				      VE_SEQ_CTRL_FORCE_IDLE |
 				      VE_SEQ_CTRL_TRIG_COMP), 0);
 
+		set_bit(BUF_DONE, &video->bufs[video->frame_idx].flags);
 		set_bit(VIDEO_FRAME_AVAILABLE, &video->flags);
 		clear_bit(VIDEO_FRAME_TRIGGERED, &video->flags);
 		wake_up_interruptible_all(&video->wait);
@@ -747,20 +759,25 @@ static int aspeed_video_start(struct aspeed_video *video)
 	if (rc)
 		aspeed_video_free_cma(video);
 
-	clear_bit(VIDEO_FRAME_TRIGGERED, &video->flags);
-
 	return rc;
 }
 
 static void aspeed_video_stop(struct aspeed_video *video)
 {
+	int i;
+
 	cancel_delayed_work_sync(&video->res_work);
 
 	aspeed_video_off(video);
 
 	aspeed_video_free_cma(video);
 
-	clear_bit(VIDEO_FRAME_AVAILABLE, &video->flags);
+	video->flags = 0;
+	video->frame_idx = 0;
+	video->bufs_queued = 0;
+
+	for (i = 0; i < NUM_BUFFERS; ++i)
+		video->bufs[i].flags = 0;
 }
 
 static int aspeed_video_querycap(struct file *file, void *fh,
@@ -888,6 +905,135 @@ static int aspeed_video_set_parm(struct file *file, void *fh,
 	return 0;
 }
 
+static int aspeed_video_reqbufs(struct file *file, void *fh,
+				struct v4l2_requestbuffers *b)
+{
+	if (b->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
+		return -EINVAL;
+
+	if (b->memory != V4L2_MEMORY_MMAP)
+		return -EINVAL;
+
+	b->count = NUM_BUFFERS;
+
+	return 0;
+}
+
+static int aspeed_video_querybuf(struct file *file, void *fh,
+				 struct v4l2_buffer *b)
+{
+	if (b->index >= NUM_BUFFERS)
+		return -EINVAL;
+
+	b->length = VE_COMP_BUFFER_SIZE;
+	b->m.offset = b->index << PAGE_SHIFT;
+
+	return 0;
+}
+
+static int aspeed_video_qbuf(struct file *file, void *fh,
+			     struct v4l2_buffer *b)
+{
+	int rc = 0;
+	struct aspeed_video *video = video_drvdata(file);
+
+	if (b->index >= NUM_BUFFERS)
+		return -EINVAL;
+
+	if (!video->bufs_queued++)
+		video->frame_idx = (b->index + 1) % NUM_BUFFERS;
+
+	if (test_bit(VIDEO_STREAMING, &video->flags) &&
+	    !test_bit(VIDEO_FRAME_TRIGGERED, &video->flags)) {
+		clear_bit(VIDEO_FRAME_AVAILABLE, &video->flags);
+		rc = aspeed_video_start_frame(video);
+	}
+
+	return rc;
+}
+
+static bool aspeed_video_buf_available(struct aspeed_video *video, int idx)
+{
+	bool rc = false;
+
+	if (test_and_clear_bit(BUF_DONE, &video->bufs[idx].flags)) {
+		rc = true;
+	} else if (test_bit(VIDEO_FRAME_AVAILABLE, &video->flags)) {
+		if (video->frame_idx == idx)
+			rc = true;
+	} else if (test_bit(VIDEO_FRAME_TRIGGERED, &video->flags)) {
+		return false;
+	}
+
+	if (test_bit(VIDEO_STREAMING, &video->flags) &&
+	    video->bufs_queued > 1) {
+		clear_bit(VIDEO_FRAME_AVAILABLE, &video->flags);
+		aspeed_video_start_frame(video);
+	}
+
+	return rc;
+}
+
+static int aspeed_video_dqbuf(struct file *file, void *fh,
+			      struct v4l2_buffer *b)
+{
+	int rc;
+	struct aspeed_video *video = video_drvdata(file);
+
+	if (b->index >= NUM_BUFFERS)
+		return -EINVAL;
+
+	if (file->f_flags & O_NONBLOCK) {
+		if (!aspeed_video_buf_available(video, b->index))
+			return -EAGAIN;
+		else
+			goto ready;
+	}
+
+	rc = wait_event_interruptible(video->wait,
+				      aspeed_video_buf_available(video,
+								 b->index));
+	if (rc)
+		return -EINTR;
+
+ready:
+	video->bufs_queued--;
+	b->bytesused = video->frame_size;
+	v4l2_get_timestamp(&b->timestamp);
+
+	return rc;
+}
+
+static int aspeed_video_streamon(struct file *file, void *fh,
+				 enum v4l2_buf_type i)
+{
+	int rc = 0;
+	struct aspeed_video *video = video_drvdata(file);
+
+	if (i != V4L2_BUF_TYPE_VIDEO_CAPTURE)
+		return -EINVAL;
+
+	set_bit(VIDEO_STREAMING, &video->flags);
+
+	if (video->bufs_queued)
+		rc = aspeed_video_start_frame(video);
+
+	return rc;
+}
+
+static int aspeed_video_streamoff(struct file *file, void *fh,
+				  enum v4l2_buf_type i)
+{
+	struct aspeed_video *video = video_drvdata(file);
+
+	if (i != V4L2_BUF_TYPE_VIDEO_CAPTURE)
+		return -EINVAL;
+
+	clear_bit(VIDEO_STREAMING, &video->flags);
+
+	return 0;
+}
+
 static const struct v4l2_ioctl_ops aspeed_video_ioctls = {
 	.vidioc_querycap = aspeed_video_querycap,
 	.vidioc_g_fmt_vid_cap = aspeed_video_get_format,
@@ -896,6 +1042,12 @@ static const struct v4l2_ioctl_ops aspeed_video_ioctls = {
 	.vidioc_s_jpegcomp = aspeed_video_set_jpegcomp,
 	.vidioc_g_parm = aspeed_video_get_parm,
 	.vidioc_s_parm = aspeed_video_set_parm,
+	.vidioc_reqbufs = aspeed_video_reqbufs,
+	.vidioc_querybuf = aspeed_video_querybuf,
+	.vidioc_qbuf = aspeed_video_qbuf,
+	.vidioc_dqbuf = aspeed_video_dqbuf,
+	.vidioc_streamon = aspeed_video_streamon,
+	.vidioc_streamoff = aspeed_video_streamoff,
 };
 
 static void aspeed_video_resolution_work(struct work_struct *work)
@@ -983,6 +1135,45 @@ unlock:
 	return rc;
 }
 
+static __poll_t aspeed_video_poll(struct file *file,
+				  struct poll_table_struct *pt)
+{
+	__poll_t rc = 0;
+	struct aspeed_video *video = video_drvdata(file);
+
+	if (mutex_lock_interruptible(&video->video_lock))
+		return EPOLLERR;
+
+	if (test_bit(VIDEO_FRAME_AVAILABLE, &video->flags)) {
+		rc = EPOLLIN | EPOLLRDNORM;
+		goto unlock;
+	}
+
+	poll_wait(file, &video->wait, pt);
+	if (test_bit(VIDEO_FRAME_AVAILABLE, &video->flags))
+		rc = EPOLLIN | EPOLLRDNORM;
+
+unlock:
+	mutex_unlock(&video->video_lock);
+	return rc;
+}
+
+static int aspeed_video_mmap(struct file *file, struct vm_area_struct *vma)
+{
+	unsigned long vsize = vma->vm_end - vma->vm_start;
+	unsigned long index = vma->vm_pgoff;
+	struct aspeed_video *video = video_drvdata(file);
+
+	if (index >= NUM_BUFFERS)
+		return -EINVAL;
+
+	if (vsize > VE_COMP_BUFFER_SIZE)
+		return -EINVAL;
+
+	return dma_mmap_coherent(video->dev, vma, video->comp[index].virt,
+				 video->comp[index].dma, vsize);
+}
+
 static int aspeed_video_open(struct file *file)
 {
 	int rc;
@@ -1016,9 +1207,11 @@ static int aspeed_video_release(struct file *file)
 static const struct v4l2_file_operations aspeed_video_v4l2_fops = {
 	.owner = THIS_MODULE,
 	.read = aspeed_video_file_read,
+	.poll = aspeed_video_poll,
+	.unlocked_ioctl = video_ioctl2,
+	.mmap = aspeed_video_mmap,
 	.open = aspeed_video_open,
 	.release = aspeed_video_release,
-	.unlocked_ioctl = video_ioctl2,
 };
 
 static void aspeed_video_device_release(struct video_device *vdev)
@@ -1038,7 +1231,8 @@ static int aspeed_video_setup_video(struct aspeed_video *video)
 	}
 
 	vdev->fops = &aspeed_video_v4l2_fops;
-	vdev->device_caps = V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_READWRITE;
+	vdev->device_caps = V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_READWRITE |
+		V4L2_CAP_STREAMING;
 	vdev->v4l2_dev = v4l2_dev;
 	strncpy(vdev->name, DEVICE_NAME, sizeof(vdev->name));
 	vdev->vfl_type = VFL_TYPE_GRABBER;
