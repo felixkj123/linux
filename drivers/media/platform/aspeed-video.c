@@ -327,6 +327,7 @@ static int aspeed_video_start_frame(struct aspeed_video *video)
 
 	video->frame_idx = (video->frame_idx + 1) % 2;
 
+	dev_dbg(video->dev, "starting frame[%d]\n", video->frame_idx);
 	aspeed_video_write(video, VE_COMP_PROC_OFFSET, 0);
 	aspeed_video_write(video, VE_COMP_OFFSET, 0);
 	aspeed_video_write(video, VE_COMP_ADDR,
@@ -440,6 +441,7 @@ static irqreturn_t aspeed_video_irq(int irq, void *arg)
 				      VE_SEQ_CTRL_FORCE_IDLE |
 				      VE_SEQ_CTRL_TRIG_COMP), 0);
 
+		dev_dbg(video->dev, "irq frame[%d] done\n", video->frame_idx);
 		set_bit(BUF_DONE, &video->bufs[video->frame_idx].flags);
 		set_bit(VIDEO_FRAME_AVAILABLE, &video->flags);
 		clear_bit(VIDEO_FRAME_TRIGGERED, &video->flags);
@@ -956,6 +958,9 @@ static bool aspeed_video_buf_available(struct aspeed_video *video, int idx)
 {
 	bool rc = false;
 
+	dev_dbg(video->dev, "buf[%d] %s flags[%08x]\n", idx,
+		test_bit(BUF_DONE, &video->bufs[idx].flags) ? "done" : "incmp",
+		video->flags);
 	if (test_and_clear_bit(BUF_DONE, &video->bufs[idx].flags)) {
 		rc = true;
 	} else if (test_bit(VIDEO_FRAME_AVAILABLE, &video->flags)) {
@@ -966,7 +971,7 @@ static bool aspeed_video_buf_available(struct aspeed_video *video, int idx)
 	}
 
 	if (test_bit(VIDEO_STREAMING, &video->flags) &&
-	    video->bufs_queued > 1) {
+	    video->bufs_queued >= 1) {
 		clear_bit(VIDEO_FRAME_AVAILABLE, &video->flags);
 		aspeed_video_start_frame(video);
 	}
@@ -1160,6 +1165,7 @@ unlock:
 
 static int aspeed_video_mmap(struct file *file, struct vm_area_struct *vma)
 {
+	int rc;
 	unsigned long vsize = vma->vm_end - vma->vm_start;
 	unsigned long index = vma->vm_pgoff;
 	struct aspeed_video *video = video_drvdata(file);
@@ -1170,8 +1176,24 @@ static int aspeed_video_mmap(struct file *file, struct vm_area_struct *vma)
 	if (vsize > VE_COMP_BUFFER_SIZE)
 		return -EINVAL;
 
-	return dma_mmap_coherent(video->dev, vma, video->comp[index].virt,
-				 video->comp[index].dma, vsize);
+	/*
+	 * Use the lower-level vm_iomap_memory because dma_mmap_coherent
+	 * doesn't seem to like multiple calls for the same device. Following
+	 * the videobuf-dma-contig implementation mostly.
+	 */
+	vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
+	vma->vm_pgoff = 0;
+
+	rc = vm_iomap_memory(vma, video->comp[index].dma, vsize);
+	if (rc)
+		return rc;
+
+	vma->vm_flags |= VM_DONTEXPAND;
+
+	dev_dbg(video->dev, "mmap'd phys[%08x] to user[%08x], size[%08x]\n",
+		video->comp[index].dma, vma->vm_start, vsize);
+
+	return 0;
 }
 
 static int aspeed_video_open(struct file *file)
