@@ -17,18 +17,16 @@
 #include <linux/delay.h>
 #include <linux/device.h>
 #include <linux/dma-mapping.h>
-#include <linux/eventpoll.h>
 #include <linux/interrupt.h>
 #include <linux/jiffies.h>
-#include <linux/mfd/syscon.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/of_irq.h>
 #include <linux/of_reserved_mem.h>
 #include <linux/platform_device.h>
-#include <linux/regmap.h>
 #include <linux/reset.h>
+#include <linux/sched.h>
 #include <linux/spinlock.h>
 #include <linux/string.h>
 #include <linux/videodev2.h>
@@ -38,21 +36,22 @@
 #include <media/v4l2-device.h>
 #include <media/v4l2-ioctl.h>
 
-#include "aspeed-video-jpeg.h"
-
 #define DEVICE_NAME			"aspeed-video"
 
-#define MAX_NUM_FRAMES			32
-#define NUM_RES_DETECT_ATTEMPTS		5
+#define ASPEED_VIDEO_JPEG_NUM_QUALITIES	12
+#define ASPEED_VIDEO_JPEG_HEADER_SIZE	10
+#define ASPEED_VIDEO_JPEG_QUANT_SIZE	116
+#define ASPEED_VIDEO_JPEG_DCT_SIZE	34
+
 #define NUM_POLARITY_CHECKS		10
-#define NUM_SPURIOUS_COMP_READY		64
+#define INVALID_RESOLUTION_RETRIES	1
+#define INVALID_RESOLUTION_DELAY	msecs_to_jiffies(250)
 #define RESOLUTION_CHANGE_DELAY		msecs_to_jiffies(500)
 #define MODE_DETECT_TIMEOUT		msecs_to_jiffies(500)
-#define DIRECT_FETCH_THRESHOLD		0xc0000
-#define PACKET_SIZE			0x20000
+#define DIRECT_FETCH_THRESHOLD		0x0c0000 /* 1024 * 768, 32bpp */
 
 #define VE_SRC_BUFFER_SIZE		0x900000 /* 1920 * 1200, 32bpp */
-#define VE_COMP_BUFFER_SIZE		0x80000 /* 128K packet * 4 packets */
+#define VE_COMP_BUFFER_SIZE		0x100000 /* 128K packet * 8 packets */
 #define VE_JPEG_BUFFER_SIZE		0x006000 /* 512 * 12 * 4 */
 
 #define VE_PROTECTION_KEY		0x000
@@ -107,13 +106,6 @@
 #define VE_SCALING_FILTER2		0x020
 #define VE_SCALING_FILTER3		0x024
 
-#define VE_BCD_CTRL			0x02c
-#define  VE_BCD_CTRL_ENABLE		BIT(0)
-#define  VE_BCD_CTRL_ABCD		BIT(1)
-#define  VE_BCD_CTRL_EN_COPY		BIT(2)
-#define  VE_BCD_CTRL_HQ_DELAY		GENMASK(4, 3)
-#define  VE_BCD_CTRL_BQ_DELAY		GENMASK(7, 5)
-
 #define VE_CAP_WINDOW			0x030
 #define VE_COMP_WINDOW			0x034
 #define VE_COMP_PROC_OFFSET		0x038
@@ -122,14 +114,11 @@
 #define VE_SRC0_ADDR			0x044
 #define VE_SRC_SCANLINE_OFFSET		0x048
 #define VE_SRC1_ADDR			0x04c
-#define VE_BCD_ADDR			0x050
 #define VE_COMP_ADDR			0x054
 
 #define VE_STREAM_BUF_SIZE		0x058
 #define  VE_STREAM_BUF_SIZE_N_PACKETS	GENMASK(5, 3)
 #define  VE_STREAM_BUF_SIZE_P_SIZE	GENMASK(2, 0)
-
-#define VE_STREAM_WRITE_OFFSET		0x05c
 
 #define VE_COMP_CTRL			0x060
 #define  VE_COMP_CTRL_VQ_DCT_ONLY	BIT(0)
@@ -145,11 +134,7 @@
 #define  VE_COMP_CTRL_HQ_DCT_CHR	GENMASK(26, 22)
 #define  VE_COMP_CTRL_HQ_DCT_LUM	GENMASK(31, 27)
 
-#define VE_BCD2_ADDR			0x06c
-#define VE_SIZE_COMP_STREAM		0x070
-#define VE_NUM_COMP_BLOCKS		0x074
 #define VE_OFFSET_COMP_STREAM		0x078
-#define VE_COMP_FRAME_COUNTER		0x07c
 
 #define VE_SRC_LR_EDGE_DET		0x090
 #define  VE_SRC_LR_EDGE_DET_LEFT	GENMASK(11, 0)
@@ -169,14 +154,6 @@
 #define VE_MODE_DETECT_STATUS		0x098
 #define  VE_MODE_DETECT_STATUS_VSYNC	BIT(28)
 #define  VE_MODE_DETECT_STATUS_HSYNC	BIT(29)
-
-#define VE_MGMT_CTRL			0x300
-#define  VE_MGMT_CTRL_RC4_RESET		BIT(8)
-#define  VE_MGMT_CTRL_COMP_24BPP	BIT(10)
-#define  VE_MGMT_CTRL_COMP_16BPP	GENMASK(11, 10)
-#define  VE_MGMT_CTRL_COMP_MODE		GENMASK(11, 10)
-#define  VE_MGMT_CTRL_LIN_RGB		BIT(29)
-#define  VE_MGMT_CTRL_CAPTURE_FMT	GENMASK(29, 28)
 
 #define VE_INTERRUPT_CTRL		0x304
 #define VE_INTERRUPT_STATUS		0x308
@@ -240,6 +217,122 @@ struct aspeed_video {
 
 #define to_aspeed_video(x) container_of((x), struct aspeed_video, v4l2_dev)
 
+static const u32 aspeed_video_jpeg_header[ASPEED_VIDEO_JPEG_HEADER_SIZE] = {
+	0xE0FFD8FF, 0x464A1000, 0x01004649, 0x60000101, 0x00006000, 0x0F00FEFF,
+	0x00002D05, 0x00000000, 0x00000000, 0x00DBFF00
+};
+
+static const u32 aspeed_video_jpeg_quant[ASPEED_VIDEO_JPEG_QUANT_SIZE] = {
+	0x081100C0, 0x00000000, 0x00110103, 0x03011102, 0xC4FF0111, 0x00001F00,
+	0x01010501, 0x01010101, 0x00000000, 0x00000000, 0x04030201, 0x08070605,
+	0xFF0B0A09, 0x10B500C4, 0x03010200, 0x03040203, 0x04040505, 0x7D010000,
+	0x00030201, 0x12051104, 0x06413121, 0x07615113, 0x32147122, 0x08A19181,
+	0xC1B14223, 0xF0D15215, 0x72623324, 0x160A0982, 0x1A191817, 0x28272625,
+	0x35342A29, 0x39383736, 0x4544433A, 0x49484746, 0x5554534A, 0x59585756,
+	0x6564635A, 0x69686766, 0x7574736A, 0x79787776, 0x8584837A, 0x89888786,
+	0x9493928A, 0x98979695, 0xA3A29A99, 0xA7A6A5A4, 0xB2AAA9A8, 0xB6B5B4B3,
+	0xBAB9B8B7, 0xC5C4C3C2, 0xC9C8C7C6, 0xD4D3D2CA, 0xD8D7D6D5, 0xE2E1DAD9,
+	0xE6E5E4E3, 0xEAE9E8E7, 0xF4F3F2F1, 0xF8F7F6F5, 0xC4FFFAF9, 0x00011F00,
+	0x01010103, 0x01010101, 0x00000101, 0x00000000, 0x04030201, 0x08070605,
+	0xFF0B0A09, 0x11B500C4, 0x02010200, 0x04030404, 0x04040507, 0x77020100,
+	0x03020100, 0x21050411, 0x41120631, 0x71610751, 0x81322213, 0x91421408,
+	0x09C1B1A1, 0xF0523323, 0xD1726215, 0x3424160A, 0x17F125E1, 0x261A1918,
+	0x2A292827, 0x38373635, 0x44433A39, 0x48474645, 0x54534A49, 0x58575655,
+	0x64635A59, 0x68676665, 0x74736A69, 0x78777675, 0x83827A79, 0x87868584,
+	0x928A8988, 0x96959493, 0x9A999897, 0xA5A4A3A2, 0xA9A8A7A6, 0xB4B3B2AA,
+	0xB8B7B6B5, 0xC3C2BAB9, 0xC7C6C5C4, 0xD2CAC9C8, 0xD6D5D4D3, 0xDAD9D8D7,
+	0xE5E4E3E2, 0xE9E8E7E6, 0xF4F3F2EA, 0xF8F7F6F5, 0xDAFFFAF9, 0x01030C00,
+	0x03110200, 0x003F0011
+};
+
+static const u32 aspeed_video_jpeg_dct[ASPEED_VIDEO_JPEG_NUM_QUALITIES]
+				      [ASPEED_VIDEO_JPEG_DCT_SIZE] = {
+	{ 0x0D140043, 0x0C0F110F, 0x11101114, 0x17141516, 0x1E20321E,
+	  0x3D1E1B1B, 0x32242E2B, 0x4B4C3F48, 0x44463F47, 0x61735A50,
+	  0x566C5550, 0x88644644, 0x7A766C65, 0x4D808280, 0x8C978D60,
+	  0x7E73967D, 0xDBFF7B80, 0x1F014300, 0x272D2121, 0x3030582D,
+	  0x697BB958, 0xB8B9B97B, 0xB9B8A6A6, 0xB9B9B9B9, 0xB9B9B9B9,
+	  0xB9B9B9B9, 0xB9B9B9B9, 0xB9B9B9B9, 0xB9B9B9B9, 0xB9B9B9B9,
+	  0xB9B9B9B9, 0xB9B9B9B9, 0xB9B9B9B9, 0xFFB9B9B9 },
+	{ 0x0C110043, 0x0A0D0F0D, 0x0F0E0F11, 0x14111213, 0x1A1C2B1A,
+	  0x351A1818, 0x2B1F2826, 0x4142373F, 0x3C3D373E, 0x55644E46,
+	  0x4B5F4A46, 0x77573D3C, 0x6B675F58, 0x43707170, 0x7A847B54,
+	  0x6E64836D, 0xDBFF6C70, 0x1B014300, 0x22271D1D, 0x2A2A4C27,
+	  0x5B6BA04C, 0xA0A0A06B, 0xA0A0A0A0, 0xA0A0A0A0, 0xA0A0A0A0,
+	  0xA0A0A0A0, 0xA0A0A0A0, 0xA0A0A0A0, 0xA0A0A0A0, 0xA0A0A0A0,
+	  0xA0A0A0A0, 0xA0A0A0A0, 0xA0A0A0A0, 0xFFA0A0A0 },
+	{ 0x090E0043, 0x090A0C0A, 0x0C0B0C0E, 0x110E0F10, 0x15172415,
+	  0x2C151313, 0x241A211F, 0x36372E34, 0x31322E33, 0x4653413A,
+	  0x3E4E3D3A, 0x62483231, 0x58564E49, 0x385D5E5D, 0x656D6645,
+	  0x5B536C5A, 0xDBFF595D, 0x16014300, 0x1C201818, 0x22223F20,
+	  0x4B58853F, 0x85858558, 0x85858585, 0x85858585, 0x85858585,
+	  0x85858585, 0x85858585, 0x85858585, 0x85858585, 0x85858585,
+	  0x85858585, 0x85858585, 0x85858585, 0xFF858585 },
+	{ 0x070B0043, 0x07080A08, 0x0A090A0B, 0x0D0B0C0C, 0x11121C11,
+	  0x23110F0F, 0x1C141A19, 0x2B2B2429, 0x27282428, 0x3842332E,
+	  0x313E302E, 0x4E392827, 0x46443E3A, 0x2C4A4A4A, 0x50565137,
+	  0x48425647, 0xDBFF474A, 0x12014300, 0x161A1313, 0x1C1C331A,
+	  0x3D486C33, 0x6C6C6C48, 0x6C6C6C6C, 0x6C6C6C6C, 0x6C6C6C6C,
+	  0x6C6C6C6C, 0x6C6C6C6C, 0x6C6C6C6C, 0x6C6C6C6C, 0x6C6C6C6C,
+	  0x6C6C6C6C, 0x6C6C6C6C, 0x6C6C6C6C, 0xFF6C6C6C },
+	{ 0x06090043, 0x05060706, 0x07070709, 0x0A09090A, 0x0D0E160D,
+	  0x1B0D0C0C, 0x16101413, 0x21221C20, 0x1E1F1C20, 0x2B332824,
+	  0x26302624, 0x3D2D1F1E, 0x3735302D, 0x22393A39, 0x3F443F2B,
+	  0x38334338, 0xDBFF3739, 0x0D014300, 0x11130E0E, 0x15152613,
+	  0x2D355026, 0x50505035, 0x50505050, 0x50505050, 0x50505050,
+	  0x50505050, 0x50505050, 0x50505050, 0x50505050, 0x50505050,
+	  0x50505050, 0x50505050, 0x50505050, 0xFF505050 },
+	{ 0x04060043, 0x03040504, 0x05040506, 0x07060606, 0x09090F09,
+	  0x12090808, 0x0F0A0D0D, 0x16161315, 0x14151315, 0x1D221B18,
+	  0x19201918, 0x281E1514, 0x2423201E, 0x17262726, 0x2A2D2A1C,
+	  0x25222D25, 0xDBFF2526, 0x09014300, 0x0B0D0A0A, 0x0E0E1A0D,
+	  0x1F25371A, 0x37373725, 0x37373737, 0x37373737, 0x37373737,
+	  0x37373737, 0x37373737, 0x37373737, 0x37373737, 0x37373737,
+	  0x37373737, 0x37373737, 0x37373737, 0xFF373737 },
+	{ 0x02030043, 0x01020202, 0x02020203, 0x03030303, 0x04040704,
+	  0x09040404, 0x07050606, 0x0B0B090A, 0x0A0A090A, 0x0E110D0C,
+	  0x0C100C0C, 0x140F0A0A, 0x1211100F, 0x0B131313, 0x1516150E,
+	  0x12111612, 0xDBFF1213, 0x04014300, 0x05060505, 0x07070D06,
+	  0x0F121B0D, 0x1B1B1B12, 0x1B1B1B1B, 0x1B1B1B1B, 0x1B1B1B1B,
+	  0x1B1B1B1B, 0x1B1B1B1B, 0x1B1B1B1B, 0x1B1B1B1B, 0x1B1B1B1B,
+	  0x1B1B1B1B, 0x1B1B1B1B, 0x1B1B1B1B, 0xFF1B1B1B },
+	{ 0x01020043, 0x01010101, 0x01010102, 0x02020202, 0x03030503,
+	  0x06030202, 0x05030404, 0x07070607, 0x06070607, 0x090B0908,
+	  0x080A0808, 0x0D0A0706, 0x0C0B0A0A, 0x070C0D0C, 0x0E0F0E09,
+	  0x0C0B0F0C, 0xDBFF0C0C, 0x03014300, 0x03040303, 0x04040804,
+	  0x0A0C1208, 0x1212120C, 0x12121212, 0x12121212, 0x12121212,
+	  0x12121212, 0x12121212, 0x12121212, 0x12121212, 0x12121212,
+	  0x12121212, 0x12121212, 0x12121212, 0xFF121212 },
+	{ 0x01020043, 0x01010101, 0x01010102, 0x02020202, 0x03030503,
+	  0x06030202, 0x05030404, 0x07070607, 0x06070607, 0x090B0908,
+	  0x080A0808, 0x0D0A0706, 0x0C0B0A0A, 0x070C0D0C, 0x0E0F0E09,
+	  0x0C0B0F0C, 0xDBFF0C0C, 0x02014300, 0x03030202, 0x04040703,
+	  0x080A0F07, 0x0F0F0F0A, 0x0F0F0F0F, 0x0F0F0F0F, 0x0F0F0F0F,
+	  0x0F0F0F0F, 0x0F0F0F0F, 0x0F0F0F0F, 0x0F0F0F0F, 0x0F0F0F0F,
+	  0x0F0F0F0F, 0x0F0F0F0F, 0x0F0F0F0F, 0xFF0F0F0F },
+	{ 0x01010043, 0x01010101, 0x01010101, 0x01010101, 0x02020302,
+	  0x04020202, 0x03020303, 0x05050405, 0x05050405, 0x07080606,
+	  0x06080606, 0x0A070505, 0x09080807, 0x05090909, 0x0A0B0A07,
+	  0x09080B09, 0xDBFF0909, 0x02014300, 0x02030202, 0x03030503,
+	  0x07080C05, 0x0C0C0C08, 0x0C0C0C0C, 0x0C0C0C0C, 0x0C0C0C0C,
+	  0x0C0C0C0C, 0x0C0C0C0C, 0x0C0C0C0C, 0x0C0C0C0C, 0x0C0C0C0C,
+	  0x0C0C0C0C, 0x0C0C0C0C, 0x0C0C0C0C, 0xFF0C0C0C },
+	{ 0x01010043, 0x01010101, 0x01010101, 0x01010101, 0x01010201,
+	  0x03010101, 0x02010202, 0x03030303, 0x03030303, 0x04050404,
+	  0x04050404, 0x06050303, 0x06050505, 0x03060606, 0x07070704,
+	  0x06050706, 0xDBFF0606, 0x01014300, 0x01020101, 0x02020402,
+	  0x05060904, 0x09090906, 0x09090909, 0x09090909, 0x09090909,
+	  0x09090909, 0x09090909, 0x09090909, 0x09090909, 0x09090909,
+	  0x09090909, 0x09090909, 0x09090909, 0xFF090909 },
+	{ 0x01010043, 0x01010101, 0x01010101, 0x01010101, 0x01010101,
+	  0x01010101, 0x01010101, 0x01010101, 0x01010101, 0x02020202,
+	  0x02020202, 0x03020101, 0x03020202, 0x01030303, 0x03030302,
+	  0x03020303, 0xDBFF0403, 0x01014300, 0x01010101, 0x01010201,
+	  0x03040602, 0x06060604, 0x06060606, 0x06060606, 0x06060606,
+	  0x06060606, 0x06060606, 0x06060606, 0x06060606, 0x06060606,
+	  0x06060606, 0x06060606, 0x06060606, 0xFF060606 }
+};
+
 static void aspeed_video_init_jpeg_table(u32 *table, bool yuv420)
 {
 	int i;
@@ -248,7 +341,8 @@ static void aspeed_video_init_jpeg_table(u32 *table, bool yuv420)
 	for (i = 0; i < ASPEED_VIDEO_JPEG_NUM_QUALITIES; i++) {
 		int j;
 
-		base = 256 * i;
+		base = 256 * i;	/* AST HW requires this header spacing */
+
 		for (j = 0; j < ASPEED_VIDEO_JPEG_HEADER_SIZE; j++)
 			table[base + j] =
 				le32_to_cpu(aspeed_video_jpeg_header[j]);
@@ -474,7 +568,9 @@ static void aspeed_video_check_polarity(struct aspeed_video *video)
 
 static int aspeed_video_get_resolution(struct aspeed_video *video)
 {
+	bool invalid_resolution = true;
 	int rc;
+	int tries = 0;
 	unsigned int bottom;
 	unsigned int left;
 	unsigned int right;
@@ -485,46 +581,60 @@ static int aspeed_video_get_resolution(struct aspeed_video *video)
 	video->fmt.width = 0;
 	video->fmt.height = 0;
 
-	aspeed_video_start_mode_detect(video);
+	do {
+		if (tries) {
+			set_current_state(TASK_INTERRUPTIBLE);
+			if (schedule_timeout(INVALID_RESOLUTION_DELAY))
+				return -EINTR;
+		}
 
-	rc = wait_event_interruptible_timeout(video->wait, res_check(video),
-					      MODE_DETECT_TIMEOUT);
-	if (!rc) {
-		dev_err(video->dev, "timed out on 1st mode detect\n");
-		aspeed_video_disable_mode_detect(video);
-		return -ETIME;
-	}
+		aspeed_video_start_mode_detect(video);
 
-	/* Disable mode detect in order to re-trigger */
-	aspeed_video_update(video, VE_SEQ_CTRL, ~VE_SEQ_CTRL_TRIG_MODE_DET, 0);
+		rc = wait_event_interruptible_timeout(video->wait,
+						      res_check(video),
+						      MODE_DETECT_TIMEOUT);
+		if (!rc) {
+			dev_err(video->dev, "timed out on 1st mode detect\n");
+			aspeed_video_disable_mode_detect(video);
+			return -ETIME;
+		}
 
-	aspeed_video_check_polarity(video);
+		/* Disable mode detect in order to re-trigger */
+		aspeed_video_update(video, VE_SEQ_CTRL,
+				    ~VE_SEQ_CTRL_TRIG_MODE_DET, 0);
 
-	aspeed_video_start_mode_detect(video);
+		aspeed_video_check_polarity(video);
 
-	rc = wait_event_interruptible_timeout(video->wait, res_check(video),
-					      MODE_DETECT_TIMEOUT);
-	if (!rc) {
-		dev_err(video->dev, "timed out on 2nd mode detect\n");
-		aspeed_video_disable_mode_detect(video);
-		return -ETIME;
-	}
+		aspeed_video_start_mode_detect(video);
 
-	src_lr_edge = aspeed_video_read(video, VE_SRC_LR_EDGE_DET);
-	src_tb_edge = aspeed_video_read(video, VE_SRC_TB_EDGE_DET);
+		rc = wait_event_interruptible_timeout(video->wait,
+						      res_check(video),
+						      MODE_DETECT_TIMEOUT);
+		if (!rc) {
+			dev_err(video->dev, "timed out on 2nd mode detect\n");
+			aspeed_video_disable_mode_detect(video);
+			return -ETIME;
+		}
 
-	bottom = (src_tb_edge & VE_SRC_TB_EDGE_DET_BOT) >>
-		VE_SRC_TB_EDGE_DET_BOT_SHF;
-	top = src_tb_edge & VE_SRC_TB_EDGE_DET_TOP;
-	if (top > bottom) {
-		dev_err(video->dev, "invalid resolution detected\n");
-		return -EMSGSIZE;
-	}
+		src_lr_edge = aspeed_video_read(video, VE_SRC_LR_EDGE_DET);
+		src_tb_edge = aspeed_video_read(video, VE_SRC_TB_EDGE_DET);
 
-	right = (src_lr_edge & VE_SRC_LR_EDGE_DET_RT) >>
-		VE_SRC_LR_EDGE_DET_RT_SHF;
-	left = src_lr_edge & VE_SRC_LR_EDGE_DET_LEFT;
-	if (left > right) {
+		bottom = (src_tb_edge & VE_SRC_TB_EDGE_DET_BOT) >>
+			VE_SRC_TB_EDGE_DET_BOT_SHF;
+		top = src_tb_edge & VE_SRC_TB_EDGE_DET_TOP;
+		if (top > bottom)
+			continue;
+
+		right = (src_lr_edge & VE_SRC_LR_EDGE_DET_RT) >>
+			VE_SRC_LR_EDGE_DET_RT_SHF;
+		left = src_lr_edge & VE_SRC_LR_EDGE_DET_LEFT;
+		if (left > right)
+			continue;
+
+		invalid_resolution = false;
+	} while (invalid_resolution && (tries++ < INVALID_RESOLUTION_RETRIES));
+
+	if (invalid_resolution) {
 		dev_err(video->dev, "invalid resolution detected\n");
 		return -EMSGSIZE;
 	}
@@ -602,8 +712,8 @@ static void aspeed_video_init_regs(struct aspeed_video *video)
 	aspeed_video_write(video, VE_CTRL, ctrl);
 	aspeed_video_write(video, VE_COMP_CTRL, comp_ctrl);
 
-	/* Compression buffer size */
-	aspeed_video_write(video, VE_STREAM_BUF_SIZE, 0x7);
+	/* Compression buffer size; 128K packet * 8 packets */
+	aspeed_video_write(video, VE_STREAM_BUF_SIZE, 0xf);
 
 	/* Don't downscale */
 	aspeed_video_write(video, VE_SCALING_FACTOR, 0x10001000);
@@ -694,15 +804,26 @@ static int aspeed_video_allocate_cma(struct aspeed_video *video)
 free_comp1:
 	dma_free_coherent(video->dev, VE_COMP_BUFFER_SIZE, video->comp[1].virt,
 			  video->comp[1].dma);
+	video->comp[1].dma = 0ULL;
+	video->comp[1].virt = NULL;
+
 free_comp0:
 	dma_free_coherent(video->dev, VE_COMP_BUFFER_SIZE, video->comp[0].virt,
 			  video->comp[0].dma);
+	video->comp[0].dma = 0ULL;
+	video->comp[0].virt = NULL;
+
 free_src1:
 	dma_free_coherent(video->dev, VE_SRC_BUFFER_SIZE, video->srcs[1].virt,
 			  video->srcs[1].dma);
+	video->srcs[1].dma = 0ULL;
+	video->srcs[1].virt = NULL;
+
 free_src0:
 	dma_free_coherent(video->dev, VE_SRC_BUFFER_SIZE, video->srcs[0].virt,
 			  video->srcs[0].dma);
+	video->srcs[0].dma = 0ULL;
+	video->srcs[0].virt = NULL;
 err:
 	return -ENOMEM;
 }
@@ -1016,9 +1137,9 @@ static int aspeed_video_release(struct file *file)
 static const struct v4l2_file_operations aspeed_video_v4l2_fops = {
 	.owner = THIS_MODULE,
 	.read = aspeed_video_file_read,
+	.unlocked_ioctl = video_ioctl2,
 	.open = aspeed_video_open,
 	.release = aspeed_video_release,
-	.unlocked_ioctl = video_ioctl2,
 };
 
 static void aspeed_video_device_release(struct video_device *vdev)
