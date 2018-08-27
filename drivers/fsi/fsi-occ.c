@@ -1,16 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0
-/*
- * On-Chip Controller Driver
- *
- * Copyright (C) IBM Corporation 2018
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
- */
 
-#include <asm/unaligned.h>
 #include <linux/device.h>
 #include <linux/err.h>
 #include <linux/errno.h>
@@ -29,6 +18,7 @@
 #include <linux/sched.h>
 #include <linux/slab.h>
 #include <linux/uaccess.h>
+#include <asm/unaligned.h>
 
 #define OCC_SRAM_BYTES		4096
 #define OCC_CMD_DATA_BYTES	4090

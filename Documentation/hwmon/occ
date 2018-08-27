@@ -28,17 +28,27 @@ Sysfs entries
 The following attributes are supported. All attributes are read-only unless
 specified.
 
-temp[1-n]_label		OCC sensor id.
-temp[1-n]_input		Measured temperature in millidegrees C.
+The OCC sensor ID is an integer that represents the unique identififer of the
+sensor with respect to the OCC. For example, a temperature sensor for the 3rd
+DIMM slot in the system may have a sensor ID of 7. This mapping is unavailable
+to the device driver, which must therefore export the sensor ID as-is.
+
+temp[1-n]_label		OCC sensor ID
+temp[1-n]_input		Measured temperature of the component in millidegrees C
 [with temperature sensor version 2+]
-    temp[1-n]_fru_type		Given FRU (Field Replaceable Unit) type.
-    temp[1-n]_fault		Temperature sensor fault.
+    temp[1-n]_type		The FRU (Field Replaceable Unit) type
+				(represented by an integer) for the component
+				that this sensor measures.
+    temp[1-n]_fault		Temperature sensor fault boolean; 1 to indicate
+				that a fault is present or 0 to indicate that
+				no fault is present.
 
-freq[1-n]_label		OCC sensor id.
-freq[1-n]_input		Measured frequency.
+freq[1-n]_label		OCC sensor ID
+freq[1-n]_input		Measured frequency of the component in MHz.
 
-power[1-n]_label	OCC sensor id.
-power[1-n]_input	Measured power in microwatts.
+power[1-n]_label	OCC sensor ID.
+power[1-n]_input	Latest measured power reading of the component in
+			microwatts.
 power[1-n]_update_tag	Number of 250us samples represented in accumulator.
 power[1-n]_accumulator	Accumulation of 250us power readings.
 [with power sensor version 2+]
