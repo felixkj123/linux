@@ -1,5 +1,8 @@
+// SPDX-License-Identifier: GPL-2.0
 /*
- * Copyright 2017 IBM Corp.
+ * OCC hwmon P8 driver
+ *
+ * Copyright (C) IBM Corporation 2018
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -121,8 +124,8 @@ static int p8_i2c_occ_send_cmd(struct occ *occ, u8 *cmd)
 	u16 data_length;
 	const unsigned long timeout = msecs_to_jiffies(OCC_TIMEOUT_MS);
 	const long int wait_time = msecs_to_jiffies(OCC_CMD_IN_PRG_WAIT_MS);
-	struct p8_i2c_occ *p8_i2c_occ = to_p8_i2c_occ(occ);
-	struct i2c_client *client = p8_i2c_occ->client;
+	struct p8_i2c_occ *ctx = to_p8_i2c_occ(occ);
+	struct i2c_client *client = ctx->client;
 	struct occ_response *resp = &occ->resp;
 
 	start = jiffies;
@@ -213,17 +216,17 @@ static int p8_i2c_occ_probe(struct i2c_client *client,
 			    const struct i2c_device_id *id)
 {
 	struct occ *occ;
-	struct p8_i2c_occ *p8_i2c_occ = devm_kzalloc(&client->dev,
-						     sizeof(*p8_i2c_occ),
-						     GFP_KERNEL);
-	if (!p8_i2c_occ)
+	struct p8_i2c_occ *ctx = devm_kzalloc(&client->dev, sizeof(*ctx),
+					      GFP_KERNEL);
+	if (!ctx)
 		return -ENOMEM;
 
-	p8_i2c_occ->client = client;
-	occ = &p8_i2c_occ->occ;
+	ctx->client = client;
+	occ = &ctx->occ;
 	occ->bus_dev = &client->dev;
 	dev_set_drvdata(&client->dev, occ);
 
+	occ->powr_sample_time_us = 250;
 	occ->poll_cmd_data = 0x10;		/* P8 OCC poll data */
 	occ->send_cmd = p8_i2c_occ_send_cmd;
 
@@ -257,6 +260,6 @@ static struct i2c_driver p8_i2c_occ_driver = {
 
 module_i2c_driver(p8_i2c_occ_driver);
 
-MODULE_AUTHOR("Eddie James <eajames@us.ibm.com>");
+MODULE_AUTHOR("Eddie James <eajames@linux.vnet.ibm.com>");
 MODULE_DESCRIPTION("BMC P8 OCC hwmon driver");
 MODULE_LICENSE("GPL");
