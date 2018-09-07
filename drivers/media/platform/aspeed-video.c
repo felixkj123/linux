@@ -43,6 +43,7 @@
 #define ASPEED_VIDEO_JPEG_QUANT_SIZE	116
 #define ASPEED_VIDEO_JPEG_DCT_SIZE	34
 
+#define MAX_FRAME_RATE			60
 #define NUM_POLARITY_CHECKS		10
 #define INVALID_RESOLUTION_RETRIES	1
 #define INVALID_RESOLUTION_DELAY	msecs_to_jiffies(250)
@@ -193,6 +194,7 @@ struct aspeed_video {
 
 	struct device *dev;
 	struct v4l2_device v4l2_dev;
+	struct v4l2_format v4l2_fmt;
 	struct video_device vdev;
 	struct mutex video_lock;
 
@@ -212,7 +214,8 @@ struct aspeed_video {
 
 	int frame_rate;
 	int jpeg_quality;
-	struct v4l2_pix_format fmt;
+	unsigned int height;
+	unsigned int width;
 };
 
 #define to_aspeed_video(x) container_of((x), struct aspeed_video, v4l2_dev)
@@ -345,20 +348,20 @@ static void aspeed_video_init_jpeg_table(u32 *table, bool yuv420)
 
 		for (j = 0; j < ASPEED_VIDEO_JPEG_HEADER_SIZE; j++)
 			table[base + j] =
-				le32_to_cpu(aspeed_video_jpeg_header[j]);
+				cpu_to_le32(aspeed_video_jpeg_header[j]);
 
 		base += ASPEED_VIDEO_JPEG_HEADER_SIZE;
 		for (j = 0; j < ASPEED_VIDEO_JPEG_DCT_SIZE; j++)
 			table[base + j] =
-				le32_to_cpu(aspeed_video_jpeg_dct[i][j]);
+				cpu_to_le32(aspeed_video_jpeg_dct[i][j]);
 
 		base += ASPEED_VIDEO_JPEG_DCT_SIZE;
 		for (j = 0; j < ASPEED_VIDEO_JPEG_QUANT_SIZE; j++)
 			table[base + j] =
-				le32_to_cpu(aspeed_video_jpeg_quant[j]);
+				cpu_to_le32(aspeed_video_jpeg_quant[j]);
 
 		if (yuv420)
-			table[base + 2] = le32_to_cpu(0x00220103);
+			table[base + 2] = cpu_to_le32(0x00220103);
 	}
 }
 
@@ -578,8 +581,8 @@ static int aspeed_video_get_resolution(struct aspeed_video *video)
 	u32 src_lr_edge;
 	u32 src_tb_edge;
 
-	video->fmt.width = 0;
-	video->fmt.height = 0;
+	video->width = 0;
+	video->height = 0;
 
 	do {
 		if (tries) {
@@ -639,11 +642,11 @@ static int aspeed_video_get_resolution(struct aspeed_video *video)
 		return -EMSGSIZE;
 	}
 
-	video->fmt.height = (bottom - top) + 1;
-	video->fmt.width = (right - left) + 1;
+	video->height = (bottom - top) + 1;
+	video->width = (right - left) + 1;
 
 	/* Don't use direct mode below 1024 x 768 (irqs don't fire) */
-	if (video->fmt.height * video->fmt.width < DIRECT_FETCH_THRESHOLD) {
+	if (video->height * video->width < DIRECT_FETCH_THRESHOLD) {
 		aspeed_video_write(video, VE_TGS_0,
 				   FIELD_PREP(VE_TGS_FIRST, left - 1) |
 				   FIELD_PREP(VE_TGS_LAST, right));
@@ -655,19 +658,18 @@ static int aspeed_video_get_resolution(struct aspeed_video *video)
 	}
 
 	aspeed_video_write(video, VE_CAP_WINDOW,
-			   video->fmt.width << 16 | video->fmt.height);
+			   video->width << 16 | video->height);
 	aspeed_video_write(video, VE_COMP_WINDOW,
-			   video->fmt.width << 16 | video->fmt.height);
-	aspeed_video_write(video, VE_SRC_SCANLINE_OFFSET,
-			   video->fmt.width * 4);
+			   video->width << 16 | video->height);
+	aspeed_video_write(video, VE_SRC_SCANLINE_OFFSET, video->width * 4);
 
 	aspeed_video_update(video, VE_INTERRUPT_CTRL, 0xFFFFFFFF,
 			    VE_INTERRUPT_MODE_DETECT_WD);
 	aspeed_video_update(video, VE_SEQ_CTRL, 0xFFFFFFFF,
 			    VE_SEQ_CTRL_EN_WATCHDOG);
 
-	dev_dbg(video->dev, "got resolution[%dx%d]\n", video->fmt.width,
-		video->fmt.height);
+	dev_dbg(video->dev, "got resolution[%dx%d]\n", video->width,
+		video->height);
 
 	return 0;
 }
@@ -683,7 +685,7 @@ static void aspeed_video_init_regs(struct aspeed_video *video)
 	if (video->frame_rate)
 		ctrl |= FIELD_PREP(VE_CTRL_FRC, video->frame_rate);
 
-	if (video->fmt.pixelformat == V4L2_PIX_FMT_YUV420)
+	if (video->v4l2_fmt.fmt.pix.pixelformat == V4L2_PIX_FMT_YUV420)
 		seq_ctrl |= VE_SEQ_CTRL_YUV420;
 
 	/* Unlock VE registers */
@@ -781,7 +783,7 @@ static int aspeed_video_allocate_cma(struct aspeed_video *video)
 		goto free_comp1;
 	}
 
-	if (video->fmt.pixelformat == V4L2_PIX_FMT_YUV420)
+	if (video->v4l2_fmt.fmt.pix.pixelformat == V4L2_PIX_FMT_YUV420)
 		aspeed_video_init_jpeg_table(video->jpeg.virt, true);
 	else
 		aspeed_video_init_jpeg_table(video->jpeg.virt, false);
@@ -868,6 +870,10 @@ static int aspeed_video_start(struct aspeed_video *video)
 	if (rc)
 		aspeed_video_free_cma(video);
 
+	video->v4l2_fmt.fmt.pix.width = video->width;
+	video->v4l2_fmt.fmt.pix.height = video->height;
+	video->v4l2_fmt.fmt.pix.sizeimage = video->width * video->height * 4;
+
 	clear_bit(VIDEO_FRAME_TRIGGERED, &video->flags);
 
 	return rc;
@@ -887,14 +893,15 @@ static void aspeed_video_stop(struct aspeed_video *video)
 static int aspeed_video_querycap(struct file *file, void *fh,
 				 struct v4l2_capability *cap)
 {
-	struct aspeed_video *video = video_drvdata(file);
-
-	strncpy(cap->driver, DEVICE_NAME, sizeof(cap->driver));
-	cap->capabilities = video->vdev.device_caps | V4L2_CAP_DEVICE_CAPS;
+	strlcpy(cap->driver, DEVICE_NAME, sizeof(cap->driver));
+	strlcpy(cap->card, "Aspeed Video Engine", sizeof(cap->card));
+	snprintf(cap->bus_info, sizeof(cap->bus_info), "platform:%s",
+		 DEVICE_NAME);
 
 	return 0;
 }
 
+/*
 static int aspeed_video_get_format(struct file *file, void *fh,
 				   struct v4l2_format *f)
 {
@@ -917,32 +924,94 @@ static int aspeed_video_get_format(struct file *file, void *fh,
 
 	return 0;
 }
+*/
+
+static int aspeed_video_enum_format(struct file *file, void *fh,
+				    struct v4l2_fmtdesc *f)
+{
+	if (f->index)
+		return -EINVAL;
+
+	f->pixelformat = V4L2_PIX_FMT_JPEG;
+	strlcpy(f->description, "JPEG", sizeof(f->description));
+	f->type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+	f->flags = V4L2_FMT_FLAG_COMPRESSED;
+
+	return 0;
+}
+
+static int aspeed_video_get_format(struct file *file, void *fh,
+				   struct v4l2_format *f)
+{
+	struct aspeed_video *video = video_drvdata(file);
+
+	*f = video->v4l2_fmt;
+
+	return 0;
+}
 
 static int aspeed_video_set_format(struct file *file, void *fh,
 				   struct v4l2_format *f)
 {
 	struct aspeed_video *video = video_drvdata(file);
 
-	if (f->fmt.pix.pixelformat == video->fmt.pixelformat)
-		return 0;
+	if (f->fmt.pix.width == video->width)
+		video->v4l2_fmt.fmt.pix.width = video->width;
 
-	if (f->fmt.pix.pixelformat == V4L2_PIX_FMT_YUV444) {
-		video->fmt.pixelformat = V4L2_PIX_FMT_YUV444;
-		aspeed_video_init_jpeg_table(video->jpeg.virt, false);
-		aspeed_video_update(video, VE_SEQ_CTRL, ~VE_SEQ_CTRL_YUV420,
-				    0);
-	} else if (f->fmt.pix.pixelformat == V4L2_PIX_FMT_YUV420) {
-		video->fmt.pixelformat = V4L2_PIX_FMT_YUV420;
-		aspeed_video_init_jpeg_table(video->jpeg.virt, true);
-		aspeed_video_update(video, VE_SEQ_CTRL, 0xFFFFFFFF,
-				    VE_SEQ_CTRL_YUV420);
-	} else {
-		return -EINVAL;
-	}
+	if (f->fmt.pix.height == video->height)
+		video->v4l2_fmt.fmt.pix.height = video->height;
+
+	return aspeed_video_get_format(file, fh, f);
+}
+
+static int aspeed_video_try_format(struct file *file, void *fh,
+				   struct v4l2_format *f)
+{
+	int rc;
+	struct aspeed_video *video = video_drvdata(file);
+	struct v4l2_pix_format pix = f->fmt.pix;
+
+	rc = aspeed_video_get_format(file, fh, f);
+	if (rc)
+		return rc;
+
+	if (pix.width == video->width)
+		f->fmt.pix.width = video->width;
+
+	if (pix.height == video->height)
+		f->fmt.pix.height = video->height;
 
 	return 0;
 }
 
+static int aspeed_video_enum_input(struct file *file, void *fh,
+				   struct v4l2_input *inp)
+{
+	if (inp->index)
+		return -EINVAL;
+
+	strlcpy(inp->name, "Host VGA capture", sizeof(inp->name));
+	inp->type = V4L2_INPUT_TYPE_CAMERA;
+
+	return 0;
+}
+
+static int aspeed_video_get_input(struct file *file, void *fh, unsigned int *i)
+{
+	*i = 0;
+
+	return 0;
+}
+
+static int aspeed_video_set_input(struct file *file, void *fh, unsigned int i)
+{
+	if (i)
+		return -EINVAL;
+
+	return 0;
+}
+
+/*
 static int aspeed_video_get_jpegcomp(struct file *file, void *fh,
 				     struct v4l2_jpegcompression *a)
 {
@@ -972,6 +1041,7 @@ static int aspeed_video_set_jpegcomp(struct file *file, void *fh,
 
 	return 0;
 }
+*/
 
 static int aspeed_video_get_parm(struct file *file, void *fh,
 				 struct v4l2_streamparm *a)
@@ -979,8 +1049,12 @@ static int aspeed_video_get_parm(struct file *file, void *fh,
 	struct aspeed_video *video = video_drvdata(file);
 
 	a->type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+	a->parm.capture.capability = V4L2_CAP_TIMEPERFRAME;
 	a->parm.capture.timeperframe.numerator = 1;
-	a->parm.capture.timeperframe.denominator = video->frame_rate;
+	if (!video->frame_rate)
+		a->parm.capture.timeperframe.denominator = MAX_FRAME_RATE + 1;
+	else
+		a->parm.capture.timeperframe.denominator = video->frame_rate;
 
 	return 0;
 }
@@ -994,11 +1068,21 @@ static int aspeed_video_set_parm(struct file *file, void *fh,
 	if (a->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
 		return -EINVAL;
 
-	frame_rate = a->parm.capture.timeperframe.denominator /
-		a->parm.capture.timeperframe.numerator;
+	a->parm.capture.capability = V4L2_CAP_TIMEPERFRAME;
 
-	if (frame_rate < 0 || frame_rate > 60)
-		return -EINVAL;
+	if (a->parm.capture.timeperframe.numerator) {
+		frame_rate = a->parm.capture.timeperframe.denominator /
+			a->parm.capture.timeperframe.numerator;
+	} else {
+		frame_rate = 0;
+		a->parm.capture.timeperframe.numerator = 1;
+	}
+
+	if (frame_rate < 0 || frame_rate > MAX_FRAME_RATE)
+		frame_rate = 0;
+
+	if (!frame_rate)
+		a->parm.capture.timeperframe.denominator = MAX_FRAME_RATE + 1;
 
 	if (video->frame_rate != frame_rate) {
 		video->frame_rate = frame_rate;
@@ -1009,14 +1093,74 @@ static int aspeed_video_set_parm(struct file *file, void *fh,
 	return 0;
 }
 
+static int aspeed_video_enum_framesizes(struct file *file, void *fh,
+					struct v4l2_frmsizeenum * fsize)
+{
+	struct aspeed_video *video = video_drvdata(file);
+
+	if (fsize->pixel_format != V4L2_PIX_FMT_JPEG)
+		return -EINVAL;
+
+	switch (fsize->index) {
+	case 0:
+		fsize->discrete.width = video->v4l2_fmt.fmt.pix.width;
+		fsize->discrete.height = video->v4l2_fmt.fmt.pix.height;
+		break;
+	case 1:
+		if (video->width == video->v4l2_fmt.fmt.pix.width &&
+		    video->height == video->v4l2_fmt.fmt.pix.height)
+			return -EINVAL;
+
+		fsize->discrete.width = video->width;
+		fsize->discrete.height = video->height;
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	fsize->type = V4L2_FRMSIZE_TYPE_DISCRETE;
+
+	return 0;
+}
+
+static int aspeed_video_enum_frameintervals(struct file *file, void *fh,
+					    struct v4l2_frmivalenum *fival)
+{
+	struct aspeed_video *video = video_drvdata(file);
+
+	if (fival->index)
+		return -EINVAL;
+
+	if (fival->width != video->width || fival->height != video->height)
+		return -EINVAL;
+
+	if (fival->pixel_format != V4L2_PIX_FMT_JPEG)
+		return -EINVAL;
+
+	fival->type = V4L2_FRMIVAL_TYPE_CONTINUOUS;
+
+	fival->stepwise.min.denominator = MAX_FRAME_RATE;
+	fival->stepwise.min.numerator = 1;
+	fival->stepwise.max.denominator = 1;
+	fival->stepwise.max.numerator = 1;
+	fival->stepwise.step = fival->stepwise.max;
+
+	return 0;
+}
+
 static const struct v4l2_ioctl_ops aspeed_video_ioctls = {
 	.vidioc_querycap = aspeed_video_querycap,
+	.vidioc_enum_fmt_vid_cap = aspeed_video_enum_format,
 	.vidioc_g_fmt_vid_cap = aspeed_video_get_format,
 	.vidioc_s_fmt_vid_cap = aspeed_video_set_format,
-	.vidioc_g_jpegcomp = aspeed_video_get_jpegcomp,
-	.vidioc_s_jpegcomp = aspeed_video_set_jpegcomp,
+	.vidioc_try_fmt_vid_cap = aspeed_video_try_format,
+	.vidioc_enum_input = aspeed_video_enum_input,
+	.vidioc_g_input = aspeed_video_get_input,
+	.vidioc_s_input = aspeed_video_set_input,
 	.vidioc_g_parm = aspeed_video_get_parm,
 	.vidioc_s_parm = aspeed_video_set_parm,
+	.vidioc_enum_framesizes = aspeed_video_enum_framesizes,
+	.vidioc_enum_frameintervals = aspeed_video_enum_frameintervals,
 };
 
 static void aspeed_video_resolution_work(struct work_struct *work)
@@ -1176,9 +1320,10 @@ static int aspeed_video_setup_video(struct aspeed_video *video)
 		return rc;
 	}
 
-	/* set pixel format defaults */
-	video->fmt.pixelformat = V4L2_PIX_FMT_YUV444;
-	video->fmt.field = V4L2_FIELD_NONE;
+	video->v4l2_fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+	video->v4l2_fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_JPEG;
+	video->v4l2_fmt.fmt.pix.field = V4L2_FIELD_NONE;
+	video->v4l2_fmt.fmt.pix.colorspace = V4L2_COLORSPACE_JPEG;
 
 	return 0;
 }
