@@ -29,11 +29,14 @@
 #include <linux/sched.h>
 #include <linux/spinlock.h>
 #include <linux/string.h>
+#include <linux/v4l2-controls.h>
 #include <linux/videodev2.h>
 #include <linux/wait.h>
 #include <linux/workqueue.h>
+#include <media/v4l2-ctrls.h>
 #include <media/v4l2-dev.h>
 #include <media/v4l2-device.h>
+#include <media/v4l2-event.h>
 #include <media/v4l2-ioctl.h>
 
 #define DEVICE_NAME			"aspeed-video"
@@ -193,6 +196,7 @@ struct aspeed_video {
 	struct reset_control *rst;
 
 	struct device *dev;
+	struct v4l2_ctrl_handler v4l2_ctrl;
 	struct v4l2_device v4l2_dev;
 	struct v4l2_format v4l2_fmt;
 	struct video_device vdev;
@@ -212,6 +216,7 @@ struct aspeed_video {
 	struct aspeed_video_addr comp[2];
 	struct aspeed_video_addr jpeg;
 
+	bool yuv420;
 	int frame_rate;
 	int jpeg_quality;
 	unsigned int height;
@@ -685,7 +690,7 @@ static void aspeed_video_init_regs(struct aspeed_video *video)
 	if (video->frame_rate)
 		ctrl |= FIELD_PREP(VE_CTRL_FRC, video->frame_rate);
 
-	if (video->v4l2_fmt.fmt.pix.pixelformat == V4L2_PIX_FMT_YUV420)
+	if (video->yuv420)
 		seq_ctrl |= VE_SEQ_CTRL_YUV420;
 
 	/* Unlock VE registers */
@@ -783,10 +788,7 @@ static int aspeed_video_allocate_cma(struct aspeed_video *video)
 		goto free_comp1;
 	}
 
-	if (video->v4l2_fmt.fmt.pix.pixelformat == V4L2_PIX_FMT_YUV420)
-		aspeed_video_init_jpeg_table(video->jpeg.virt, true);
-	else
-		aspeed_video_init_jpeg_table(video->jpeg.virt, false);
+	aspeed_video_init_jpeg_table(video->jpeg.virt, video->yuv420);
 
 	/*
 	 * Calculate the memory restrictions. Don't consider the JPEG header
@@ -1148,7 +1150,7 @@ static int aspeed_video_enum_frameintervals(struct file *file, void *fh,
 	return 0;
 }
 
-static const struct v4l2_ioctl_ops aspeed_video_ioctls = {
+static const struct v4l2_ioctl_ops aspeed_video_ioctl_ops = {
 	.vidioc_querycap = aspeed_video_querycap,
 	.vidioc_enum_fmt_vid_cap = aspeed_video_enum_format,
 	.vidioc_g_fmt_vid_cap = aspeed_video_get_format,
@@ -1161,6 +1163,68 @@ static const struct v4l2_ioctl_ops aspeed_video_ioctls = {
 	.vidioc_s_parm = aspeed_video_set_parm,
 	.vidioc_enum_framesizes = aspeed_video_enum_framesizes,
 	.vidioc_enum_frameintervals = aspeed_video_enum_frameintervals,
+	.vidioc_subscribe_event = v4l2_ctrl_subscribe_event,
+	.vidioc_unsubscribe_event = v4l2_event_unsubscribe,
+};
+
+static void aspeed_video_update_jpeg_quality(struct aspeed_video *video)
+{
+	u32 comp_ctrl = FIELD_PREP(VE_COMP_CTRL_DCT_LUM, video->jpeg_quality) |
+		FIELD_PREP(VE_COMP_CTRL_DCT_CHR, video->jpeg_quality | 0x10);
+
+	aspeed_video_update(video, VE_COMP_CTRL,
+			    ~(VE_COMP_CTRL_DCT_LUM | VE_COMP_CTRL_DCT_CHR),
+			    comp_ctrl);
+}
+
+static void aspeed_video_update_subsampling(struct aspeed_video *video)
+{
+	if (video->jpeg.virt)
+		aspeed_video_init_jpeg_table(video->jpeg.virt, video->yuv420);
+
+	if (video->yuv420)
+		aspeed_video_update(video, VE_SEQ_CTRL, 0xFFFFFFFF,
+				    VE_SEQ_CTRL_YUV420);
+	else
+		aspeed_video_update(video, VE_SEQ_CTRL, ~VE_SEQ_CTRL_YUV420,
+				    0);
+}
+
+static int aspeed_video_set_ctrl(struct v4l2_ctrl *ctrl)
+{
+	struct aspeed_video *video = container_of(ctrl->handler,
+						  struct aspeed_video,
+						  v4l2_ctrl);
+
+	switch (ctrl->id) {
+	case V4L2_CID_JPEG_COMPRESSION_QUALITY:
+		if (video->jpeg_quality != ctrl->val) {
+			video->jpeg_quality = ctrl->val;
+			aspeed_video_update_jpeg_quality(video);
+		}
+		break;
+	case V4L2_CID_JPEG_CHROMA_SUBSAMPLING:
+		if (ctrl->val == V4L2_JPEG_CHROMA_SUBSAMPLING_420) {
+			if (!video->yuv420) {
+				video->yuv420 = true;
+				aspeed_video_update_subsampling(video);
+			}
+		} else {
+			if (video->yuv420) {
+				video->yuv420 = false;
+				aspeed_video_update_subsampling(video);
+			}
+		}
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+static const struct v4l2_ctrl_ops aspeed_video_ctrl_ops = {
+	.s_ctrl = aspeed_video_set_ctrl,
 };
 
 static void aspeed_video_resolution_work(struct work_struct *work)
@@ -1293,6 +1357,8 @@ static void aspeed_video_device_release(struct video_device *vdev)
 static int aspeed_video_setup_video(struct aspeed_video *video)
 {
 	int rc;
+	u64 mask = ~(BIT(V4L2_JPEG_CHROMA_SUBSAMPLING_444) |
+		     BIT(V4L2_JPEG_CHROMA_SUBSAMPLING_420));
 	struct v4l2_device *v4l2_dev = &video->v4l2_dev;
 	struct video_device *vdev = &video->vdev;
 
@@ -1309,7 +1375,7 @@ static int aspeed_video_setup_video(struct aspeed_video *video)
 	vdev->vfl_type = VFL_TYPE_GRABBER;
 	vdev->vfl_dir = VFL_DIR_RX;
 	vdev->release = aspeed_video_device_release;
-	vdev->ioctl_ops = &aspeed_video_ioctls;
+	vdev->ioctl_ops = &aspeed_video_ioctl_ops;
 	vdev->lock = &video->video_lock;
 
 	video_set_drvdata(vdev, video);
@@ -1324,6 +1390,27 @@ static int aspeed_video_setup_video(struct aspeed_video *video)
 	video->v4l2_fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_JPEG;
 	video->v4l2_fmt.fmt.pix.field = V4L2_FIELD_NONE;
 	video->v4l2_fmt.fmt.pix.colorspace = V4L2_COLORSPACE_JPEG;
+
+	/* Don't fail the probe if controls init fails */
+	v4l2_ctrl_handler_init(&video->v4l2_ctrl, 2);
+
+	v4l2_ctrl_new_std(&video->v4l2_ctrl, &aspeed_video_ctrl_ops,
+			  V4L2_CID_JPEG_COMPRESSION_QUALITY, 0,
+			  ASPEED_VIDEO_JPEG_NUM_QUALITIES - 1, 1, 0);
+
+	v4l2_ctrl_new_std_menu(&video->v4l2_ctrl, &aspeed_video_ctrl_ops,
+			       V4L2_CID_JPEG_CHROMA_SUBSAMPLING,
+			       V4L2_JPEG_CHROMA_SUBSAMPLING_420, mask,
+			       V4L2_JPEG_CHROMA_SUBSAMPLING_444);
+
+	if (video->v4l2_ctrl.error) {
+		dev_info(video->dev, "Failed to init controls: %d\n",
+			 video->v4l2_ctrl.error);
+		v4l2_ctrl_handler_free(&video->v4l2_ctrl);
+	} else {
+		v4l2_dev->ctrl_handler = &video->v4l2_ctrl;
+		vdev->ctrl_handler = &video->v4l2_ctrl;
+	}
 
 	return 0;
 }
@@ -1419,6 +1506,9 @@ static int aspeed_video_remove(struct platform_device *pdev)
 	struct device *dev = &pdev->dev;
 	struct v4l2_device *v4l2_dev = dev_get_drvdata(dev);
 	struct aspeed_video *video = to_aspeed_video(v4l2_dev);
+
+	if (video->vdev.ctrl_handler)
+		v4l2_ctrl_handler_free(&video->v4l2_ctrl);
 
 	video_unregister_device(&video->vdev);
 
