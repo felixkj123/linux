@@ -709,4 +709,8 @@
 	memory-region = <&video_engine_memory>;
 };
 
+&xdma {
+	status = "okay";
+};
+
 #include "ibm-power9-dual.dtsi"
