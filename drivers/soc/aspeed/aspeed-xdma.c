@@ -143,6 +143,7 @@ struct aspeed_xdma {
 	void *cmdq_vga_virt;
 	struct gen_pool *vga_pool;
 
+	char pcidev[4];
 	struct miscdevice misc;
 };
 
@@ -164,6 +165,10 @@ static const u32 aspeed_xdma_vga_pcie_conf = SCU_PCIE_CONF_VGA_EN |
 	SCU_PCIE_CONF_VGA_EN_MSI | SCU_PCIE_CONF_VGA_EN_MCTP |
 	SCU_PCIE_CONF_VGA_EN_IRQ | SCU_PCIE_CONF_VGA_EN_DMA |
 	SCU_PCIE_CONF_RSVD;
+
+static char *_pcidev = "vga";
+module_param_named(pcidev, _pcidev, charp, 0600);
+MODULE_PARM_DESC(pcidev, "Default PCI device used by XDMA engine for DMA ops");
 
 static void aspeed_scu_pcie_write(struct aspeed_xdma *ctx, u32 conf)
 {
@@ -512,7 +517,7 @@ static const struct file_operations aspeed_xdma_fops = {
 	.release		= aspeed_xdma_release,
 };
 
-static int aspeed_xdma_init_mem(struct aspeed_xdma *ctx)
+static int aspeed_xdma_init_mem(struct aspeed_xdma *ctx, u32 conf)
 {
 	int rc;
 	u32 scu_conf = 0;
@@ -522,7 +527,7 @@ static int aspeed_xdma_init_mem(struct aspeed_xdma *ctx)
 	const u32 vga_sizes[4] = { 0x800000, 0x1000000, 0x2000000, 0x4000000 };
 	void __iomem *sdmc_base = ioremap(0x1e6e0000, 0x100);
 
-	aspeed_scu_pcie_write(ctx, aspeed_xdma_vga_pcie_conf);
+	aspeed_scu_pcie_write(ctx, conf);
 
 	regmap_read(ctx->scu, SCU_STRAP, &scu_conf);
 	ctx->vga_size = vga_sizes[FIELD_GET(SCU_STRAP_VGA_MEM, scu_conf)];
@@ -598,10 +603,91 @@ err_genalloc:
 	return rc;
 }
 
+static int aspeed_xdma_change_pcie_conf(struct aspeed_xdma *ctx, u32 conf)
+{
+	int rc;
+
+	mutex_lock(&ctx->start_lock);
+	rc = wait_event_interruptible_timeout(ctx->wait,
+					      !test_bit(XDMA_IN_PRG,
+							&ctx->flags),
+					      msecs_to_jiffies(1000));
+	if (rc < 0) {
+		mutex_unlock(&ctx->start_lock);
+		return -EINTR;
+	}
+
+	/* previous op didn't complete, wake up waiters anyway */
+	if (!rc)
+		wake_up_interruptible_all(&ctx->wait);
+
+	reset_control_assert(ctx->reset);
+	msleep(10);
+
+	aspeed_scu_pcie_write(ctx, conf);
+	msleep(10);
+
+	reset_control_deassert(ctx->reset);
+	msleep(10);
+
+	aspeed_xdma_init_eng(ctx);
+
+	mutex_unlock(&ctx->start_lock);
+
+	return 0;
+}
+
+static int aspeed_xdma_pcidev_to_conf(struct aspeed_xdma *ctx,
+				      const char *pcidev, u32 *conf)
+{
+	if (!strcasecmp(pcidev, "vga")) {
+		*conf = aspeed_xdma_vga_pcie_conf;
+		return 0;
+	}
+
+	if (!strcasecmp(pcidev, "bmc")) {
+		*conf = aspeed_xdma_bmc_pcie_conf;
+		return 0;
+	}
+
+	return -EINVAL;
+}
+
+static ssize_t aspeed_xdma_show_pcidev(struct device *dev,
+				       struct device_attribute *attr,
+				       char *buf)
+{
+	struct aspeed_xdma *ctx = dev_get_drvdata(dev);
+
+	return snprintf(buf, PAGE_SIZE - 1, "%s", ctx->pcidev);
+}
+
+static ssize_t aspeed_xdma_store_pcidev(struct device *dev,
+					struct device_attribute *attr,
+					const char *buf, size_t count)
+{
+	u32 conf;
+	struct aspeed_xdma *ctx = dev_get_drvdata(dev);
+	int rc = aspeed_xdma_pcidev_to_conf(ctx, buf, &conf);
+
+	if (rc)
+		return rc;
+
+	rc = aspeed_xdma_change_pcie_conf(ctx, conf);
+	if (rc)
+		return rc;
+
+	strcpy(ctx->pcidev, buf);
+	return count;
+}
+static DEVICE_ATTR(pcidev, 0644, aspeed_xdma_show_pcidev,
+		   aspeed_xdma_store_pcidev);
+
 static int aspeed_xdma_probe(struct platform_device *pdev)
 {
 	int irq;
 	int rc;
+	u32 conf;
 	struct resource *res;
 	struct device *dev = &pdev->dev;
 	struct aspeed_xdma *ctx = devm_kzalloc(dev, sizeof(*ctx), GFP_KERNEL);
@@ -657,7 +743,14 @@ static int aspeed_xdma_probe(struct platform_device *pdev)
 
 	msleep(10);
 
-	rc = aspeed_xdma_init_mem(ctx);
+	if (aspeed_xdma_pcidev_to_conf(ctx, _pcidev, &conf)) {
+		conf = aspeed_xdma_vga_pcie_conf;
+		strcpy(ctx->pcidev, "vga");
+	} else {
+		strcpy(ctx->pcidev, _pcidev);
+	}
+
+	rc = aspeed_xdma_init_mem(ctx, conf);
 	if (rc) {
 		reset_control_assert(ctx->reset);
 		return rc;
@@ -682,12 +775,16 @@ static int aspeed_xdma_probe(struct platform_device *pdev)
 		return rc;
 	}
 
+	device_create_file(dev, &dev_attr_pcidev);
+
 	return 0;
 }
 
 static int aspeed_xdma_remove(struct platform_device *pdev)
 {
 	struct aspeed_xdma *ctx = platform_get_drvdata(pdev);
+
+	device_remove_file(ctx->dev, &dev_attr_pcidev);
 
 	misc_deregister(&ctx->misc);
 	gen_pool_free(ctx->vga_pool, (unsigned long)ctx->cmdq_vga_virt,
