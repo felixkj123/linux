@@ -60,7 +60,7 @@
 #define XDMA_MAX_LINE_SIZE		BIT(10)
 #define XDMA_NUM_CMDS			\
 	(XDMA_CMDQ_SIZE / sizeof(struct aspeed_xdma_cmd))
-#define XDMA_NUM_DEBUGFS_REGS		6
+#define XDMA_NUM_DEBUGFS_REGS		28
 
 #define XDMA_CMD_BMC_CHECK		BIT(0)
 #define XDMA_CMD_BMC_ADDR		GENMASK(29, 4)
@@ -87,6 +87,10 @@
 #define XDMA_DS_PCIE_REQ_SIZE_2K	4
 #define XDMA_DS_PCIE_REQ_SIZE_4K	5
 
+#define XDMA_HOST_CMD_QUEUE_ADDR0	0x00
+#define XDMA_HOST_CMD_QUEUE_ENDP	0x04
+#define XDMA_HOST_CMD_QUEUE_WRITEP	0x08
+#define XDMA_HOST_CMD_QUEUE_READP	0x0c
 #define XDMA_BMC_CMD_QUEUE_ADDR		0x10
 #define XDMA_BMC_CMD_QUEUE_ENDP		0x14
 #define XDMA_BMC_CMD_QUEUE_WRITEP	0x18
@@ -102,6 +106,24 @@
 #define XDMA_STATUS			0x24
 #define  XDMA_STATUS_US_COMP		BIT(4)
 #define  XDMA_STATUS_DS_COMP		BIT(5)
+#define XDMA_DS_FRAME_SIZE		0x28
+#define XDMA_PROBE_DS_PCIE		0x30
+#define XDMA_PROBE_US_PCIE		0x34
+#define XDMA_INPRG_DS_CMD1		0x38
+#define XDMA_INPRG_DS_CMD2		0x3c
+#define XDMA_INPRG_US_CMD00		0x40
+#define XDMA_INPRG_US_CMD01		0x44
+#define XDMA_INPRG_US_CMD10		0x48
+#define XDMA_INPRG_US_CMD11		0x4c
+#define XDMA_INPRG_US_CMD20		0x50
+#define XDMA_INPRG_US_CMD21		0x54
+#define XDMA_HOST_CMD_QUEUE_ADDR1	0x60
+#define XDMA_VGA_CMD_QUEUE_ADDR0	0x64
+#define XDMA_VGA_CMD_QUEUE_ENDP		0x68
+#define XDMA_VGA_CMD_QUEUE_WRITEP	0x6c
+#define XDMA_VGA_CMD_QUEUE_READP	0x70
+#define XDMA_VGA_CMD_STATUS		0x74
+#define XDMA_VGA_CMD_QUEUE_ADDR1	0x78
 
 enum {
 	XDMA_IN_PRG,
@@ -673,18 +695,62 @@ static void aspeed_xdma_init_debugfs(struct aspeed_xdma *ctx)
 	debugfs_create_file("vga", 0444, ctx->debugfs_dir, ctx,
 			    &aspeed_xdma_debugfs_vga_fops);
 
-	ctx->regs[0].name = "addr";
-	ctx->regs[0].offset = XDMA_BMC_CMD_QUEUE_ADDR;
-	ctx->regs[1].name = "endp";
-	ctx->regs[1].offset = XDMA_BMC_CMD_QUEUE_ENDP;
-	ctx->regs[2].name = "writep";
-	ctx->regs[2].offset = XDMA_BMC_CMD_QUEUE_WRITEP;
-	ctx->regs[3].name = "readp";
-	ctx->regs[3].offset = XDMA_BMC_CMD_QUEUE_READP;
-	ctx->regs[4].name = "control";
-	ctx->regs[4].offset = XDMA_CTRL;
-	ctx->regs[5].name = "status";
-	ctx->regs[5].offset = XDMA_STATUS;
+	ctx->regs[0].name = "host_q_addr31";
+	ctx->regs[0].offset = XDMA_HOST_CMD_QUEUE_ADDR0;
+	ctx->regs[1].name = "host_q_addr63";
+	ctx->regs[1].offset = XDMA_HOST_CMD_QUEUE_ADDR1;
+	ctx->regs[2].name = "host_q_endp";
+	ctx->regs[2].offset = XDMA_HOST_CMD_QUEUE_ENDP;
+	ctx->regs[3].name = "host_q_writep";
+	ctx->regs[3].offset = XDMA_HOST_CMD_QUEUE_WRITEP;
+	ctx->regs[4].name = "host_q_readp";
+	ctx->regs[4].offset = XDMA_HOST_CMD_QUEUE_READP;
+	ctx->regs[5].name = "bmc_q_addr";
+	ctx->regs[5].offset = XDMA_BMC_CMD_QUEUE_ADDR;
+	ctx->regs[6].name = "bmc_q_endp";
+	ctx->regs[6].offset = XDMA_BMC_CMD_QUEUE_ENDP;
+	ctx->regs[7].name = "bmc_q_writep";
+	ctx->regs[7].offset = XDMA_BMC_CMD_QUEUE_WRITEP;
+	ctx->regs[8].name = "bmc_q_readp";
+	ctx->regs[8].offset = XDMA_BMC_CMD_QUEUE_READP;
+	ctx->regs[9].name = "control";
+	ctx->regs[9].offset = XDMA_CTRL;
+	ctx->regs[10].name = "status";
+	ctx->regs[10].offset = XDMA_STATUS;
+	ctx->regs[11].name = "ds_frame_size";
+	ctx->regs[11].offset = XDMA_DS_FRAME_SIZE;
+	ctx->regs[12].name = "probe_ds_pcie";
+	ctx->regs[12].offset = XDMA_PROBE_DS_PCIE;
+	ctx->regs[13].name = "probe_us_pcie";
+	ctx->regs[13].offset = XDMA_PROBE_US_PCIE;
+	ctx->regs[14].name = "inprg_ds1";
+	ctx->regs[14].offset = XDMA_INPRG_DS_CMD1;
+	ctx->regs[15].name = "inprg_ds2";
+	ctx->regs[15].offset = XDMA_INPRG_DS_CMD2;
+	ctx->regs[16].name = "inprg_us031";
+	ctx->regs[16].offset = XDMA_INPRG_US_CMD00;
+	ctx->regs[17].name = "inprg_us063";
+	ctx->regs[17].offset = XDMA_INPRG_US_CMD01;
+	ctx->regs[18].name = "inprg_us131";
+	ctx->regs[18].offset = XDMA_INPRG_US_CMD10;
+	ctx->regs[19].name = "inprg_us163";
+	ctx->regs[19].offset = XDMA_INPRG_US_CMD11;
+	ctx->regs[20].name = "inprg_us231";
+	ctx->regs[20].offset = XDMA_INPRG_US_CMD20;
+	ctx->regs[21].name = "inprg_us263";
+	ctx->regs[21].offset = XDMA_INPRG_US_CMD21;
+	ctx->regs[22].name = "vga_q_addr31";
+	ctx->regs[22].offset = XDMA_VGA_CMD_QUEUE_ADDR0;
+	ctx->regs[23].name = "vga_q_addr63";
+	ctx->regs[23].offset = XDMA_VGA_CMD_QUEUE_ADDR1;
+	ctx->regs[24].name = "vga_q_endp";
+	ctx->regs[24].offset = XDMA_VGA_CMD_QUEUE_ENDP;
+	ctx->regs[25].name = "vga_q_writep";
+	ctx->regs[25].offset = XDMA_VGA_CMD_QUEUE_WRITEP;
+	ctx->regs[26].name = "vga_q_readp";
+	ctx->regs[26].offset = XDMA_VGA_CMD_QUEUE_READP;
+	ctx->regs[27].name = "vga_cmd_status";
+	ctx->regs[27].offset = XDMA_VGA_CMD_STATUS;
 
 	ctx->regset.regs = ctx->regs;
 	ctx->regset.nregs = XDMA_NUM_DEBUGFS_REGS;
@@ -730,12 +796,12 @@ static int aspeed_xdma_change_pcie_conf(struct aspeed_xdma *ctx, u32 conf)
 static int aspeed_xdma_pcidev_to_conf(struct aspeed_xdma *ctx,
 				      const char *pcidev, u32 *conf)
 {
-	if (!strcasecmp(pcidev, "vga")) {
+	if (!strncasecmp(pcidev, "vga", 3)) {
 		*conf = aspeed_xdma_vga_pcie_conf;
 		return 0;
 	}
 
-	if (!strcasecmp(pcidev, "bmc")) {
+	if (!strncasecmp(pcidev, "bmc", 3)) {
 		*conf = aspeed_xdma_bmc_pcie_conf;
 		return 0;
 	}
@@ -749,7 +815,7 @@ static ssize_t aspeed_xdma_show_pcidev(struct device *dev,
 {
 	struct aspeed_xdma *ctx = dev_get_drvdata(dev);
 
-	return snprintf(buf, PAGE_SIZE - 1, "%s", ctx->pcidev);
+	return snprintf(buf, PAGE_SIZE - 1, "%s\n", ctx->pcidev);
 }
 
 static ssize_t aspeed_xdma_store_pcidev(struct device *dev,
@@ -767,7 +833,7 @@ static ssize_t aspeed_xdma_store_pcidev(struct device *dev,
 	if (rc)
 		return rc;
 
-	strcpy(ctx->pcidev, buf);
+	strncpy(ctx->pcidev, buf, 3);
 	return count;
 }
 static DEVICE_ATTR(pcidev, 0644, aspeed_xdma_show_pcidev,
