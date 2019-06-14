@@ -49,6 +49,9 @@
 #define  SCU_PCIE_CONF_BMC_EN_DMA	BIT(14)
 #define  SCU_PCIE_CONF_RSVD		GENMASK(19, 18)
 
+#define SCU_BMC_CLASS_REV		0x19c
+#define  SCU_BMC_CLASS_REV_XDMA		0xff000001
+
 #define SDMC_CONF			0x004
 #define  SDMC_CONF_MEM			GENMASK(1, 0)
 #define SDMC_REMAP			0x008
@@ -556,6 +559,8 @@ static int aspeed_xdma_init_mem(struct aspeed_xdma *ctx, u32 conf)
 	void __iomem *sdmc_base = ioremap(0x1e6e0000, 0x100);
 
 	aspeed_scu_pcie_write(ctx, conf);
+
+	regmap_write(ctx->scu, SCU_BMC_CLASS_REV, SCU_BMC_CLASS_REV_XDMA);
 
 	regmap_read(ctx->scu, SCU_STRAP, &scu_conf);
 	ctx->vga_size = vga_sizes[FIELD_GET(SCU_STRAP_VGA_MEM, scu_conf)];
