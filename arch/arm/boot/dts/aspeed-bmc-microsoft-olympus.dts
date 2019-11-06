@@ -211,10 +211,10 @@
 
 };
 
-&gfx {
-      status = "okay";
-      memory-region = <&gfx_memory>;
-};
+//&gfx {
+//      status = "okay";
+//      memory-region = <&gfx_memory>;
+//};
 
 &video {
         status = "okay";
