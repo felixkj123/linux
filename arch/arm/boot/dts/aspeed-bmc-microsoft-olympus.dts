@@ -211,14 +211,18 @@
 
 };
 
-//&gfx {
-//      status = "okay";
-//      memory-region = <&gfx_memory>;
-//};
+&vuart {
+        status = "okay";
+};
+
+&gfx {
+      status = "okay";
+      memory-region = <&gfx_memory>;
+};
 
 &video {
         status = "okay";
-        memory-region = <&vga_memory>;
+        memory-region = <&gfx_memory>;
 };
 
 &vhub {
