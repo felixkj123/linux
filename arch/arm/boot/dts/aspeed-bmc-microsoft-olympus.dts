@@ -218,7 +218,7 @@
 
 &video {
         status = "okay";
-        memory-region = <&gfx_memory>;
+        memory-region = <&vga_memory>;
 };
 
 &vhub {
