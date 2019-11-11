@@ -34,6 +34,13 @@
                         compatible = "shared-dma-pool";
                         reusable;
                 };
+                video_engine_memory: jpegbuffer {
+                        size = <0x02000000>;    /* 32MM */
+                        alignment = <0x01000000>;
+                        compatible = "shared-dma-pool";
+                        reusable;
+               };
+
         };
 
         leds {//              compatible = "gpio-leds";
@@ -222,7 +229,7 @@
 
 &video {
         status = "okay";
-        memory-region = <&gfx_memory>;
+        memory-region = <&video_engine_memory>;
 };
 
 &vhub {
