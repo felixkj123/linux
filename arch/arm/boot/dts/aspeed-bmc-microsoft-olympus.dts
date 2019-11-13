@@ -27,30 +27,46 @@
 			no-map;
 			reg = <0x5f000000 0x01000000>; /* 16M */
 		};
+
+		gfx_memory: framebuffer {
+                        size = <0x01000000>;
+                        alignment = <0x01000000>;
+                        compatible = "shared-dma-pool";
+                        reusable;
+                };
+
+                video_engine_memory: jpegbuffer {
+                        size = <0x02000000>;    /* 32MM */
+                        alignment = <0x01000000>;
+                        compatible = "shared-dma-pool";
+                        reusable;
+                };
+
+
 	};
 
 	leds {
-		compatible = "gpio-leds";
-
-		bmc_heartbeat {
-			gpios = <&gpio ASPEED_GPIO(B, 0) GPIO_ACTIVE_LOW>;
-		};
-
-		power_green {
-			gpios = <&gpio ASPEED_GPIO(U, 2) GPIO_ACTIVE_HIGH>;
-		};
-
-		power_amber {
-			gpios = <&gpio ASPEED_GPIO(U, 3) GPIO_ACTIVE_HIGH>;
-		};
-
-		identify {
-			gpios = <&gpio ASPEED_GPIO(Q, 5) GPIO_ACTIVE_LOW>;
-		};
-
-		fault {
-			gpios = <&gpio ASPEED_GPIO(A, 1) GPIO_ACTIVE_LOW>;
-		};
+//		compatible = "gpio-leds";
+//
+//		bmc_heartbeat {
+//			gpios = <&gpio ASPEED_GPIO(B, 0) GPIO_ACTIVE_LOW>;
+//		};
+//
+//		power_green {
+//			gpios = <&gpio ASPEED_GPIO(U, 2) GPIO_ACTIVE_HIGH>;
+//		};
+//
+//		power_amber {
+//			gpios = <&gpio ASPEED_GPIO(U, 3) GPIO_ACTIVE_HIGH>;
+//		};
+//
+//		identify {
+//			gpios = <&gpio ASPEED_GPIO(Q, 5) GPIO_ACTIVE_LOW>;
+//		};
+//
+//		fault {
+//			gpios = <&gpio ASPEED_GPIO(A, 1) GPIO_ACTIVE_LOW>;
+//		};
 	};
 
 
@@ -205,3 +221,19 @@
 	};
 
 };
+
+&gfx {
+      status = "okay";
+      memory-region = <&gfx_memory>;
+};
+
+
+&vhub {
+        status = "okay";
+};
+
+&video {
+        status = "okay";
+        memory-region = <&video_engine_memory>;
+};
+
