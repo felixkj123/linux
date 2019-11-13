@@ -271,7 +271,6 @@
                                 clock-names = "vclk-gate", "eclk-gate";
                                 resets = <&syscon ASPEED_RESET_VIDEO>;
                                 interrupts = <7>;
-                                //reg-scu = <&syscon>;
                                 status = "disabled";
 			};
 			
