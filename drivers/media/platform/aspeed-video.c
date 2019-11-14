@@ -1603,12 +1603,12 @@ static int aspeed_video_init(struct aspeed_video *video)
 	if (rc)
 		return rc;
 
-	video->vclk = devm_clk_get(dev, "vclk");
+	/*video->vclk = devm_clk_get(dev, "vclk");
 	if (IS_ERR(video->vclk)) {
 		dev_err(dev, "Unable to get VCLK\n");
 		rc = PTR_ERR(video->vclk);
 		goto err_unprepare_eclk;
-	}
+	}*/
 
 	rc = clk_prepare(video->vclk);
 	if (rc)
